@@ -1,0 +1,10 @@
+{
+  "project_name": "ImageNet_pretrain_test",
+  "model_type": "tf_efficientnetv2_s_in21k",
+  "train_type": "clean",
+  "pretrain_dataset": "ImageNet",
+  "pretrain_classes": 1000,
+  "finetune_dataset": "BATL",
+  "finetune_classes": 2,
+  "save_path": "/nas/vista-ssd01/users/jmathai/batl"
+}
