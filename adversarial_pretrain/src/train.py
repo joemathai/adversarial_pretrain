@@ -34,7 +34,9 @@ class AdvPreTrain:
                         f"_finetune_{self.finetune_dataset}"
 
         # define model and pretraining dataset
-        self.model = MixBNModelBuilder(model_type=self.model_type, pretrained=False, mix_bn=False)
+        self.model = MixBNModelBuilder(model_type=self.model_type, num_classes=self.pretrain_classes,
+                                       pretrained=False, mix_bn=False).to(DEVICE)
+
         base_dir = pathlib.Path(f"{self.save_path}/{self.project_name}/{self.exp_name}")
         base_dir.mkdir(parents=True, exist_ok=True)
 
@@ -76,21 +78,25 @@ class AdvPreTrain:
 
     def pretrain_imagenet(self):
         pretrain_epochs = 100
-        batch_size = 128
+        batch_size = 198
         pretrain_lr = 1e-2
         pretrain_wd = 1e-3
 
         # copy imagenet data locally
         imagenet_root = pathlib.Path(f"{os.getenv('TMPDIR')}/imagenet_data")
         imagenet_root.mkdir(exist_ok=True, parents=True)
-        shutil.copy("/nas/vista-ssd01/batl/public_datasets/ImageNet/ILSVRC2012_img_train.tar",
-                    str(imagenet_root))
-        shutil.copy("/nas/vista-ssd01/batl/public_datasets/ImageNet/ILSVRC2012_img_val.tar",
-                    str(imagenet_root))
-        shutil.copy("/nas/vista-ssd01/batl/public_datasets/ImageNet/ILSVRC2012_devkit_t12.tar.gz",
-                    str(imagenet_root))
+        if not (imagenet_root / "ILSVRC2012_img_train.tar").is_file():
+            shutil.copy("/nas/vista-ssd01/batl/public_datasets/ImageNet/ILSVRC2012_img_train.tar", str(imagenet_root))
+        if not (imagenet_root / "ILSVRC2012_img_val.tar").is_file():
+            shutil.copy("/nas/vista-ssd01/batl/public_datasets/ImageNet/ILSVRC2012_img_val.tar", str(imagenet_root))
+        if not (imagenet_root / "ILSVRC2012_devkit_t12.tar.gz").is_file():
+            shutil.copy("/nas/vista-ssd01/batl/public_datasets/ImageNet/ILSVRC2012_devkit_t12.tar.gz",
+                        str(imagenet_root))
+        if not (imagenet_root / "meta.bin").is_file():
+            shutil.copy("/nas/vista-ssd01/batl/public_datasets/ImageNet/meta.bin",
+                        str(imagenet_root))
 
-        pretrain_train_dataset = torchvision.datasets.ImageNet(root="",
+        pretrain_train_dataset = torchvision.datasets.ImageNet(root=imagenet_root,
                                                                split="train",
                                                                transform=torchvision.transforms.Compose([
                                                                    torchvision.transforms.RandomResizedCrop(224),
@@ -102,7 +108,7 @@ class AdvPreTrain:
                                                        worker_init_fn=lambda wid: np.random.seed(
                                                            np.random.get_state()[1][0] + wid)
                                                        )
-        pretrain_valid_dataset = torchvision.datasets.ImageNet(root="",
+        pretrain_valid_dataset = torchvision.datasets.ImageNet(root=imagenet_root,
                                                                split="val",
                                                                transform=torchvision.transforms.Compose([
                                                                    torchvision.transforms.Resize(256),
@@ -132,14 +138,19 @@ class AdvPreTrain:
                     loss = criterion(preds, labels)
 
                 acc1, acc5 = AdvPreTrain.accuracy(preds, labels, topk=(1, 5))
-                print(f"epoch:{epoch + 1}, batch:{batch_idx + 1}, loss:{loss.item():.6f}, acc1:{acc1}, acc5:{acc5}")
+                print(f"epoch:{epoch + 1}, batch:{batch_idx + 1}/{len(train_dataloader)}, "
+                      f"loss:{loss.item():.6f}, acc1:{acc1.item()}, acc5:{acc5.item()}")
                 wandb.log({'pretrain/loss': loss.item()})
                 losses.append(loss.item())
-                acc1s.append(acc1)
-                acc5s.append(acc5)
+                acc1s.append(acc1.item())
+                acc5s.append(acc5.item())
 
+                # scale the loss so that no underflow happens and then call backward
                 scaler.scale(loss).backward()
+                # unscale the gradients and then decide to do the step if no NaN
                 scaler.step(optimizer)
+                # reset the scaler for next iteration
+                scaler.update()
 
             wandb.log({'pretrain/epoch_avg_loss': np.mean(losses),
                        'pretrain/epoch_avg_acc1': np.mean(acc1s),
@@ -159,8 +170,8 @@ class AdvPreTrain:
                     acc1, acc5 = AdvPreTrain.accuracy(preds, labels, topk=(1, 5))
                     loss = criterion(preds, labels)
                     val_losses.append(loss.item())
-                    val_acc1s.append(acc1)
-                    val_acc5s.append(acc5)
+                    val_acc1s.append(acc1.item())
+                    val_acc5s.append(acc5.item())
                 wandb.log({'pretrain/validation_loss:': np.mean(val_losses),
                            'pretrain/validation_acc1:': np.mean(val_acc1s),
                            'pretrain/validation_acc5': np.mean(val_acc5s)})
