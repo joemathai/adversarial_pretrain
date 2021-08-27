@@ -3,6 +3,7 @@ import os
 import pathlib
 import json
 import shutil
+import time
 
 import numpy as np
 import torch
@@ -96,7 +97,7 @@ class AdvPreTrain:
             shutil.copy("/nas/vista-ssd01/batl/public_datasets/ImageNet/meta.bin",
                         str(imagenet_root))
 
-        pretrain_train_dataset = torchvision.datasets.ImageNet(root=imagenet_root,
+        pretrain_train_dataset = torchvision.datasets.ImageNet(root=str(imagenet_root),
                                                                split="train",
                                                                transform=torchvision.transforms.Compose([
                                                                    torchvision.transforms.RandomResizedCrop(224),
@@ -108,7 +109,7 @@ class AdvPreTrain:
                                                        worker_init_fn=lambda wid: np.random.seed(
                                                            np.random.get_state()[1][0] + wid)
                                                        )
-        pretrain_valid_dataset = torchvision.datasets.ImageNet(root=imagenet_root,
+        pretrain_valid_dataset = torchvision.datasets.ImageNet(root=str(imagenet_root),
                                                                split="val",
                                                                transform=torchvision.transforms.Compose([
                                                                    torchvision.transforms.Resize(256),
@@ -126,20 +127,24 @@ class AdvPreTrain:
         best_val_acc1 = -np.inf
 
         for epoch in range(pretrain_epochs):
+            start_epoch = time.time()
             losses = list()
             acc1s = list()
             acc5s = list()
             for batch_idx, (data, labels) in enumerate(train_dataloader):
                 data, labels = data.float().to(DEVICE, non_blocking=True), labels.long().to(DEVICE, non_blocking=True)
-
+                start_batch = time.time()
                 optimizer.zero_grad()
                 with torch.cuda.amp.autocast():
                     preds = self.model(data)
                     loss = criterion(preds, labels)
 
                 acc1, acc5 = AdvPreTrain.accuracy(preds, labels, topk=(1, 5))
-                print(f"epoch:{epoch + 1}, batch:{batch_idx + 1}/{len(train_dataloader)}, "
-                      f"loss:{loss.item():.6f}, acc1:{acc1.item()}, acc5:{acc5.item()}")
+                if batch_idx % 10 == 0:
+                    print(f"epoch:{epoch + 1}, batch:{batch_idx + 1}/{len(train_dataloader)}, "
+                          f"loss:{loss.item():.6f}, acc1:{acc1.item()}, acc5:{acc5.item()}, "
+                          f"time: {time.time() - start_batch:.5f}")
+
                 wandb.log({'pretrain/loss': loss.item()})
                 losses.append(loss.item())
                 acc1s.append(acc1.item())
@@ -154,7 +159,8 @@ class AdvPreTrain:
 
             wandb.log({'pretrain/epoch_avg_loss': np.mean(losses),
                        'pretrain/epoch_avg_acc1': np.mean(acc1s),
-                       'pretrain/epoch_avg_acc5': np.mean(acc5s)})
+                       'pretrain/epoch_avg_acc5': np.mean(acc5s),
+                       'pretrain/epoch_time:': (time.time() - start_epoch) / 60})
             scheduler.step()
 
             # validate
