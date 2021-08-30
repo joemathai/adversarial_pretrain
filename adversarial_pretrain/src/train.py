@@ -133,7 +133,7 @@ class AdvPreTrain:
         valid_dataloader = torch.utils.data.DataLoader(pretrain_valid_dataset, batch_size=batch_size,
                                                        shuffle=False, num_workers=0, pin_memory=False, drop_last=False)
 
-        criterion = LabelSmoothingCrossEntropy(smoothing=1.0)
+        criterion = LabelSmoothingCrossEntropy(smoothing=0.1)
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=pretrain_lr, weight_decay=pretrain_wd)
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
 
