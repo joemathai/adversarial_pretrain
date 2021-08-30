@@ -11,6 +11,7 @@ import wandb
 import torchvision
 
 from adversarial_pretrain.src.models.timm_model_loader import MixBNModelBuilder
+from adversarial_pretrain.src.utils.loss import LabelSmoothingCrossEntropy
 
 torch.backends.cudnn.benchmark = True
 DEVICE = torch.device('cuda')
@@ -26,12 +27,12 @@ class AdvPreTrain:
         self.project_name = self.config['project_name']
         self.model_type = self.config['model_type']
         self.train_type = self.config['train_type']
-        self.pretrain_dataset = self.config['pretrain_dataset']
+        self.pretrain_dataset_name = self.config['pretrain_dataset_name']
         self.pretrain_classes = self.config['pretrain_classes']
         self.finetune_dataset = self.config['finetune_dataset']
         self.finetune_classes = self.config['finetune_classes']
         self.save_path = self.config['save_path']
-        self.exp_name = f"{self.train_type}_{self.model_type}_seed_{seed}_pretrain_{self.pretrain_dataset}"\
+        self.exp_name = f"{self.train_type}_{self.model_type}_seed_{seed}_pretrain_{self.pretrain_dataset_name}"\
                         f"_finetune_{self.finetune_dataset}"
 
         # define model and pretraining dataset
@@ -79,22 +80,22 @@ class AdvPreTrain:
 
     def pretrain_imagenet(self):
         pretrain_epochs = 100
-        batch_size = 198
-        pretrain_lr = 1e-2
-        pretrain_wd = 1e-3
+        batch_size = 224
+        pretrain_lr = 3e-4
+        pretrain_wd = 1e-4
 
         # copy imagenet data locally
         imagenet_root = pathlib.Path(f"{os.getenv('TMPDIR')}/imagenet_data")
         imagenet_root.mkdir(exist_ok=True, parents=True)
         if not (imagenet_root / "ILSVRC2012_img_train.tar").is_file():
-            shutil.copy("/nas/vista-ssd01/batl/public_datasets/ImageNet/ILSVRC2012_img_train.tar", str(imagenet_root))
+            shutil.copy(f"{self.config['pretrain_dataset_root']}/ILSVRC2012_img_train.tar", str(imagenet_root))
         if not (imagenet_root / "ILSVRC2012_img_val.tar").is_file():
-            shutil.copy("/nas/vista-ssd01/batl/public_datasets/ImageNet/ILSVRC2012_img_val.tar", str(imagenet_root))
+            shutil.copy(f"{self.config['pretrain_dataset_root']}/ILSVRC2012_img_val.tar", str(imagenet_root))
         if not (imagenet_root / "ILSVRC2012_devkit_t12.tar.gz").is_file():
-            shutil.copy("/nas/vista-ssd01/batl/public_datasets/ImageNet/ILSVRC2012_devkit_t12.tar.gz",
+            shutil.copy(f"{self.config['pretrain_dataset_root']}/ILSVRC2012_devkit_t12.tar.gz",
                         str(imagenet_root))
         if not (imagenet_root / "meta.bin").is_file():
-            shutil.copy("/nas/vista-ssd01/batl/public_datasets/ImageNet/meta.bin",
+            shutil.copy(f"{self.config['pretrain_dataset_root']}/meta.bin",
                         str(imagenet_root))
 
         pretrain_train_dataset = torchvision.datasets.ImageNet(root=str(imagenet_root),
@@ -119,48 +120,28 @@ class AdvPreTrain:
         valid_dataloader = torch.utils.data.DataLoader(pretrain_valid_dataset, batch_size=batch_size,
                                                        shuffle=False, num_workers=0, pin_memory=False, drop_last=False)
 
-        criterion = torch.nn.CrossEntropyLoss().to(DEVICE)
+        criterion = LabelSmoothingCrossEntropy(smoothing=1.0)
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=pretrain_lr, weight_decay=pretrain_wd)
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
-        scaler = torch.cuda.amp.GradScaler()
 
         best_val_acc1 = -np.inf
-
         for epoch in range(pretrain_epochs):
-            start_epoch = time.time()
-            losses = list()
-            acc1s = list()
-            acc5s = list()
             for batch_idx, (data, labels) in enumerate(train_dataloader):
                 data, labels = data.float().to(DEVICE, non_blocking=True), labels.long().to(DEVICE, non_blocking=True)
                 start_batch = time.time()
-                optimizer.zero_grad()
-                with torch.cuda.amp.autocast():
-                    preds = self.model(data)
-                    loss = criterion(preds, labels)
-
+                preds = self.model(data)
+                loss = criterion(preds, labels)
                 acc1, acc5 = AdvPreTrain.accuracy(preds, labels, topk=(1, 5))
-                if batch_idx % 10 == 0:
+                if batch_idx % 50 == 0:
                     print(f"epoch:{epoch + 1}, batch:{batch_idx + 1}/{len(train_dataloader)}, "
                           f"loss:{loss.item():.6f}, acc1:{acc1.item()}, acc5:{acc5.item()}, "
                           f"time: {time.time() - start_batch:.5f}")
+                wandb.log({'pretrain/loss': loss.item(), 'pretrain/acc1': acc1.item(), 'pretrain/acc5': acc5.item(),
+                           'pretrain/batch_time:': time.time() - start_batch})
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
 
-                wandb.log({'pretrain/loss': loss.item()})
-                losses.append(loss.item())
-                acc1s.append(acc1.item())
-                acc5s.append(acc5.item())
-
-                # scale the loss so that no underflow happens and then call backward
-                scaler.scale(loss).backward()
-                # unscale the gradients and then decide to do the step if no NaN
-                scaler.step(optimizer)
-                # reset the scaler for next iteration
-                scaler.update()
-
-            wandb.log({'pretrain/epoch_avg_loss': np.mean(losses),
-                       'pretrain/epoch_avg_acc1': np.mean(acc1s),
-                       'pretrain/epoch_avg_acc5': np.mean(acc5s),
-                       'pretrain/epoch_time:': (time.time() - start_epoch) / 60})
             scheduler.step()
 
             # validate
