@@ -5,7 +5,29 @@
   "pretrain_dataset_name": "ImageNet",
   "pretrain_dataset_root": "/nas/vista-ssd01/batl/public_datasets/ImageNet",
   "pretrain_classes": 1000,
+  "pretrain_adversary": false,
   "finetune_dataset": "BATL",
   "finetune_classes": 2,
-  "save_path": "/nas/vista-ssd01/users/jmathai/batl"
+  "save_path": "/nas/vista-ssd01/users/jmathai/batl",
+  "adversary_config": {
+    "ConvolutionalKernel": null,
+    "AffineTransforms": null,
+    "SWIRColorTransforms": null,
+    "AdjustHueSaturation": null,
+    "SpatialFlowFields": null,
+    "ThinPlateSplines": null,
+    "RotationTranslationTransforms": null,
+    "ColorTransforms": null,
+    "ColorTransformsCIELUV": null,
+    "ColorTransformsHSV": null,
+    "IndependentChannelColorTransforms": null,
+    "GaussianBlur": null,
+    "AdjustSharpness": null,
+    "AdjustGamma": null,
+    "AdjustBrightnessContrast": null,
+    "Delta": {
+      "step_size": 0.003921,
+      "linf_budget": 0.01568
+    }
+  }
 }

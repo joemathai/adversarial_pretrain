@@ -10,7 +10,9 @@ import torch
 import wandb
 import torchvision
 
+from functional_attacks import pgd_attack_linf, validation
 from adversarial_pretrain.src.models.timm_model_loader import MixBNModelBuilder
+from adversarial_pretrain.src.models.adv_perturbation_net import RandomAdvPerturbationNetwork
 from adversarial_pretrain.src.utils.loss import LabelSmoothingCrossEntropy
 
 torch.backends.cudnn.benchmark = True
@@ -29,6 +31,8 @@ class AdvPreTrain:
         self.train_type = self.config['train_type']
         self.pretrain_dataset_name = self.config['pretrain_dataset_name']
         self.pretrain_classes = self.config['pretrain_classes']
+        self.pretrain_adversary = self.config['pretrain_adversary']
+        self.adversary_config = self.config['adversary_config']
         self.finetune_dataset = self.config['finetune_dataset']
         self.finetune_classes = self.config['finetune_classes']
         self.save_path = self.config['save_path']
@@ -78,10 +82,19 @@ class AdvPreTrain:
         model.load_state_dict(snapshot['model'])
         model.to(device)
 
+    def get_adversarial_batch(self, batch, labels, pgd_iterations=5):
+        self.model.eval()
+        adversary = RandomAdvPerturbationNetwork(batch.shape, random_init=True, config=self.adversary_config).to(DEVICE)
+        adv_batch = pgd_attack_linf(adversary, self.model, batch, labels, num_iterations=pgd_iterations,
+                                    validator=validation, loss_fn_type='xent')
+        wandb.log({"pretrain/adv_success_rate": validation(self.model, batch, adv_batch, labels)})
+        self.model.train()
+        return adv_batch
+
     def pretrain_imagenet(self):
         pretrain_epochs = 100
         batch_size = 224
-        pretrain_lr = 3e-4
+        pretrain_lr = 2e-4
         pretrain_wd = 1e-4
 
         # copy imagenet data locally
@@ -129,6 +142,13 @@ class AdvPreTrain:
             for batch_idx, (data, labels) in enumerate(train_dataloader):
                 data, labels = data.float().to(DEVICE, non_blocking=True), labels.long().to(DEVICE, non_blocking=True)
                 start_batch = time.time()
+
+                if self.pretrain_adversary:
+                    half_batch_size = data.shape[0] // 2
+                    half_adv_batch = self.get_adversarial_batch(data[half_batch_size:], labels[half_batch_size:])
+                    with torch.no_grad():
+                        data[half_batch_size:].copy_(half_adv_batch)
+
                 preds = self.model(data)
                 loss = criterion(preds, labels)
                 acc1, acc5 = AdvPreTrain.accuracy(preds, labels, topk=(1, 5))
@@ -138,8 +158,11 @@ class AdvPreTrain:
                           f"time: {time.time() - start_batch:.5f}")
                 wandb.log({'pretrain/loss': loss.item(), 'pretrain/acc1': acc1.item(), 'pretrain/acc5': acc5.item(),
                            'pretrain/batch_time:': time.time() - start_batch})
+
                 optimizer.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm(self.model.parameters(), max_norm=2.0, norm_type=2.0,
+                                              error_if_nonfinite=True)
                 optimizer.step()
 
             scheduler.step()
