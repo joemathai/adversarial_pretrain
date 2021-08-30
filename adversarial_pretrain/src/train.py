@@ -173,8 +173,7 @@ class AdvPreTrain:
 
                 optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm(self.model.parameters(), max_norm=2.0, norm_type=2.0,
-                                              error_if_nonfinite=True)
+                torch.nn.utils.clip_grad_norm(self.model.parameters(), max_norm=2.0, norm_type=2.0)
                 optimizer.step()
 
             scheduler.step()
