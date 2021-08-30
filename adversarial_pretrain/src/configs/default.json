@@ -1,5 +1,6 @@
 {
   "project_name": "ImageNet_pretrain_test",
+  "exp_prefix": "test01",
   "model_type": "tf_efficientnetv2_s_in21k",
   "train_type": "clean",
   "pretrain_dataset_name": "ImageNet",

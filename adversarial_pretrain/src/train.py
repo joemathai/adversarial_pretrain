@@ -27,6 +27,7 @@ class AdvPreTrain:
             self.config = json.load(fh)
 
         self.project_name = self.config['project_name']
+        self.exp_prefix = self.config['exp_prefix']
         self.model_type = self.config['model_type']
         self.train_type = self.config['train_type']
         self.pretrain_dataset_name = self.config['pretrain_dataset_name']
@@ -36,7 +37,8 @@ class AdvPreTrain:
         self.finetune_dataset = self.config['finetune_dataset']
         self.finetune_classes = self.config['finetune_classes']
         self.save_path = self.config['save_path']
-        self.exp_name = f"{self.train_type}_{self.model_type}_seed_{seed}_pretrain_{self.pretrain_dataset_name}"\
+
+        self.exp_name = f"{self.exp_prefix}_{self.train_type}_{self.model_type}_pretrain_{self.pretrain_dataset_name}"\
                         f"_finetune_{self.finetune_dataset}"
 
         # define model and pretraining dataset
@@ -53,7 +55,7 @@ class AdvPreTrain:
 
         # initialize wandb
         self.wandb_run = wandb.init(project=self.project_name, dir=os.getenv('TMPDIR'),
-                                    name=self.exp_name, id=self.exp_name, reinit=True)
+                                    name=self.exp_name, id=self.exp_name, reinit=True, resume=True)
 
     @staticmethod
     def accuracy(output, target, topk=(1,)):
@@ -71,16 +73,20 @@ class AdvPreTrain:
             return res
 
     @staticmethod
-    def snapshot_gpu(model, optimizer, epoch, path):
+    def snapshot_gpu(model, optimizer, scheduler, epoch, best_val, path):
         torch.save({'model': model.state_dict(),
                     'optimizer': optimizer.state_dict(),
-                    'cur_epoch': epoch}, path)
+                    'scheduler': scheduler.state_dict(),
+                    'cur_epoch': epoch,
+                    'best_val': best_val}, path)
 
     @staticmethod
-    def load_snapshot(model, path, device):
+    def load_snapshot(model, optimizer, scheduler, path, device):
         snapshot = torch.load(path, map_location=device)
         model.load_state_dict(snapshot['model'])
-        model.to(device)
+        optimizer.load_state_dict(snapshot['optimizer'])
+        scheduler.load_state_dict(snapshot['scheduler'])
+        return snapshot['cur_epoch'], snapshot['best_val']
 
     def get_adversarial_batch(self, batch, labels, pgd_iterations=5):
         self.model.eval()
@@ -94,7 +100,7 @@ class AdvPreTrain:
     def pretrain_imagenet(self):
         pretrain_epochs = 100
         batch_size = 224
-        pretrain_lr = 2e-4
+        pretrain_lr = 3e-4
         pretrain_wd = 1e-4
 
         # copy imagenet data locally
@@ -133,12 +139,18 @@ class AdvPreTrain:
         valid_dataloader = torch.utils.data.DataLoader(pretrain_valid_dataset, batch_size=batch_size,
                                                        shuffle=False, num_workers=0, pin_memory=False, drop_last=False)
 
+        cur_epoch = 0
+        best_val_acc1 = -np.inf
         criterion = LabelSmoothingCrossEntropy(smoothing=0.1)
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=pretrain_lr, weight_decay=pretrain_wd)
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[80, 95], gamma=0.1)
 
-        best_val_acc1 = -np.inf
-        for epoch in range(pretrain_epochs):
+        if self.pretrain_cur_model.is_file():
+            cur_epoch, best_val_acc1 = AdvPreTrain.load_snapshot(self.model, optimizer, scheduler,
+                                                                 self.pretrain_cur_model, device=DEVICE)
+            print(f'loaded the previous state trained to epoch:{cur_epoch} with best_val:{best_val_acc1}')
+
+        for epoch in range(cur_epoch, pretrain_epochs):
             for batch_idx, (data, labels) in enumerate(train_dataloader):
                 data, labels = data.float().to(DEVICE, non_blocking=True), labels.long().to(DEVICE, non_blocking=True)
                 start_batch = time.time()
@@ -188,7 +200,11 @@ class AdvPreTrain:
 
                 if np.mean(val_acc1s) > best_val_acc1:
                     best_val_acc1 = np.mean(val_acc1s)
-                    AdvPreTrain.snapshot_gpu(self.model, optimizer, epoch, self.pretrain_best_model)
+                    AdvPreTrain.snapshot_gpu(self.model, optimizer, scheduler, epoch, best_val_acc1,
+                                             self.pretrain_best_model)
+
+            # save cur state
+            AdvPreTrain.snapshot_gpu(self.model, optimizer, scheduler, epoch, best_val_acc1, self.pretrain_cur_model)
 
     def finetune(self):
         pass
