@@ -178,7 +178,8 @@ class AdvPreTrain:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=2.0, norm_type=2.0)
             optimizer.step()
 
-            print(f"epoch: {iter_num // len(train_dataloader) + 1}, batch: {iter_num + 1}/{len(train_dataloader)}"
+            print(f"epoch: {iter_num // len(train_dataloader) + 1}, "
+                  f"batch: {iter_num % len (train_dataloader)}/{len(train_dataloader)}"
                   f" loss: {loss.item():.7f} batch_time: {time.time() - start_batch}")
 
             # periodically plot the accuracies on train batch
