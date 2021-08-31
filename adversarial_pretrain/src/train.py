@@ -155,6 +155,7 @@ class AdvPreTrain:
             print(f'loaded the previous state trained to iter:{cur_iter} with best_val:{best_val_acc1}')
 
         train_dataloader_iter = iter(train_dataloader)
+        start_batch = time.time()
         for iter_num in range(cur_iter, pretrain_epochs * len(train_dataloader)):
             try:
                 data, labels = next(train_dataloader_iter)
@@ -163,7 +164,6 @@ class AdvPreTrain:
                 data, labels = next(train_dataloader_iter)
 
             data, labels = data.float().to(DEVICE, non_blocking=True), labels.long().to(DEVICE, non_blocking=True)
-            start_batch = time.time()
 
             if self.pretrain_adversary:
                 half_batch_size = data.shape[0] // 2
@@ -181,6 +181,8 @@ class AdvPreTrain:
             print(f"epoch: {iter_num // len(train_dataloader) + 1}, "
                   f"batch: {iter_num % len (train_dataloader)}/{len(train_dataloader)}"
                   f" loss: {loss.item():.7f} batch_time: {time.time() - start_batch}")
+
+            start_batch = time.time()
 
             # periodically plot the accuracies on train batch
             if iter_num % 100 == 0:
