@@ -173,18 +173,21 @@ class AdvPreTrain:
 
             preds = self.model(data)
             loss = criterion(preds, labels)
-            print(f"epoch: {iter_num // len(train_dataloader) + 1}, batch: {iter_num + 1}/{len(train_dataloader)}"
-                  f"loss: {loss.item():.7f}")
-            if iter_num % 100 == 0:
-                acc1, acc5 = AdvPreTrain.accuracy(preds, labels, topk=(1, 5))
-                wandb.log({'pretrain/acc1': acc1.item(), 'pretrain/acc5': acc5.item(),
-                           'pretrain/batch_time:': time.time() - start_batch})
-
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=2.0, norm_type=2.0)
             optimizer.step()
 
+            print(f"epoch: {iter_num // len(train_dataloader) + 1}, batch: {iter_num + 1}/{len(train_dataloader)}"
+                  f" loss: {loss.item():.7f} batch_time: {time.time() - start_batch}")
+
+            # periodically plot the accuracies on train batch
+            if iter_num % 100 == 0:
+                acc1, acc5 = AdvPreTrain.accuracy(preds, labels, topk=(1, 5))
+                wandb.log({'pretrain/acc1': acc1.item(), 'pretrain/acc5': acc5.item(),
+                           'pretrain/batch_time:': time.time() - start_batch})
+
+            # step the scheduler after an epoch
             if (iter_num % len(train_dataloader) + 1) == len(train_dataloader):
                 scheduler.step()
 
