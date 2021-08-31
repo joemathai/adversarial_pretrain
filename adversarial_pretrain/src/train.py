@@ -107,10 +107,13 @@ class AdvPreTrain:
         imagenet_root = pathlib.Path(f"{os.getenv('TMPDIR')}/imagenet_data")
         imagenet_root.mkdir(exist_ok=True, parents=True)
         if not (imagenet_root / "ILSVRC2012_img_train.tar").is_file():
+            print('copying ImageNet train.tar to LFS')
             shutil.copy(f"{self.config['pretrain_dataset_root']}/ILSVRC2012_img_train.tar", str(imagenet_root))
         if not (imagenet_root / "ILSVRC2012_img_val.tar").is_file():
+            print('copying ImageNet val.tar to LFS')
             shutil.copy(f"{self.config['pretrain_dataset_root']}/ILSVRC2012_img_val.tar", str(imagenet_root))
         if not (imagenet_root / "ILSVRC2012_devkit_t12.tar.gz").is_file():
+            print('copying ImageNet devkit.tar to LFS')
             shutil.copy(f"{self.config['pretrain_dataset_root']}/ILSVRC2012_devkit_t12.tar.gz",
                         str(imagenet_root))
         if not (imagenet_root / "meta.bin").is_file():
@@ -170,18 +173,16 @@ class AdvPreTrain:
 
             preds = self.model(data)
             loss = criterion(preds, labels)
-
-            if iter_num % 50 == 0:
+            print(f"epoch: {iter_num // len(train_dataloader) + 1}, batch: {iter_num + 1}/{len(train_dataloader)}"
+                  f"loss: {loss.item():.7f}")
+            if iter_num % 100 == 0:
                 acc1, acc5 = AdvPreTrain.accuracy(preds, labels, topk=(1, 5))
-                print(f"epoch:{iter_num // len(train_dataloader) + 1}, batch:{iter_num + 1}/{len(train_dataloader)}, "
-                      f"loss:{loss.item():.6f}, acc1:{acc1.item()}, acc5:{acc5.item()}, "
-                      f"time: {time.time() - start_batch:.5f}")
-                wandb.log({'pretrain/loss': loss.item(), 'pretrain/acc1': acc1.item(), 'pretrain/acc5': acc5.item(),
+                wandb.log({'pretrain/acc1': acc1.item(), 'pretrain/acc5': acc5.item(),
                            'pretrain/batch_time:': time.time() - start_batch})
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm(self.model.parameters(), max_norm=2.0, norm_type=2.0)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=2.0, norm_type=2.0)
             optimizer.step()
 
             if (iter_num % len(train_dataloader) + 1) == len(train_dataloader):
