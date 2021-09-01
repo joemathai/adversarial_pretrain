@@ -187,13 +187,13 @@ class AdvPreTrain:
                 start_batch = time.time()
 
                 # periodically plot the accuracies on train batch
-                if batch_idx % 200 == 0:
+                if (batch_idx + 1) % 200 == 0:
                     acc1, acc5 = AdvPreTrain.accuracy(preds, labels, topk=(1, 5))
                     wandb.log({'pretrain/acc1': acc1.item(), 'pretrain/acc5': acc5.item(),
                                'pretrain/batch_time:': time.time() - start_batch})
 
                 # validate and checkpoint
-                if batch_idx % 1000:
+                if (batch_idx + 1) % 1000 == 0:
                     with torch.no_grad():
                         # note this averaging is not exactly correct because of change in batch size amongst validation
                         # but this should be good enough for validation purposes
