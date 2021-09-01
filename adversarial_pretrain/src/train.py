@@ -128,9 +128,11 @@ class AdvPreTrain:
                                                                    torchvision.transforms.ToTensor()
                                                                ]))
         train_dataloader = torch.utils.data.DataLoader(pretrain_train_dataset, batch_size=batch_size,
-                                                       shuffle=True, num_workers=4, pin_memory=True, drop_last=True,
+                                                       shuffle=True, num_workers=6, pin_memory=True, drop_last=True,
                                                        worker_init_fn=lambda wid: np.random.seed(
-                                                           np.random.get_state()[1][0] + wid)
+                                                           np.random.get_state()[1][0] + wid),
+                                                       prefetch_factor=32,
+                                                       presistent_workers=True
                                                        )
         pretrain_valid_dataset = torchvision.datasets.ImageNet(root=str(imagenet_root),
                                                                split="val",
@@ -140,7 +142,7 @@ class AdvPreTrain:
                                                                    torchvision.transforms.ToTensor()
                                                                ]))
         valid_dataloader = torch.utils.data.DataLoader(pretrain_valid_dataset, batch_size=batch_size,
-                                                       shuffle=False, num_workers=0, pin_memory=False, drop_last=False)
+                                                       shuffle=False, num_workers=2, pin_memory=False, drop_last=False)
 
         cur_iter = 0
         best_val_acc1 = -np.inf
@@ -156,73 +158,74 @@ class AdvPreTrain:
 
         train_dataloader_iter = iter(train_dataloader)
         start_batch = time.time()
-        for iter_num in range(cur_iter, pretrain_epochs * len(train_dataloader)):
-            try:
-                data, labels = next(train_dataloader_iter)
-            except StopIteration:
-                train_dataloader_iter = iter(train_dataloader)
-                data, labels = next(train_dataloader_iter)
+        cur_epoch = cur_iter // len(train_dataloader)
+        for epoch_idx in range(cur_epoch, pretrain_epochs):
+            for batch_idx, (data, labels) in enumerate(train_dataloader):
+                data, labels = data.float().to(DEVICE, non_blocking=True), labels.long().to(DEVICE, non_blocking=True)
 
-            data, labels = data.float().to(DEVICE, non_blocking=True), labels.long().to(DEVICE, non_blocking=True)
+                # this is guarantee more or less everything is trained to equal amounts
+                if cur_iter % len(train_dataloader) + batch_idx > len(train_dataloader):
+                    break
 
-            if self.pretrain_adversary:
-                half_batch_size = data.shape[0] // 2
-                half_adv_batch = self.get_adversarial_batch(data[half_batch_size:], labels[half_batch_size:])
-                with torch.no_grad():
-                    data[half_batch_size:].copy_(half_adv_batch)
+                if self.pretrain_adversary:
+                    half_batch_size = data.shape[0] // 2
+                    half_adv_batch = self.get_adversarial_batch(data[half_batch_size:], labels[half_batch_size:])
+                    with torch.no_grad():
+                        data[half_batch_size:].copy_(half_adv_batch)
 
-            preds = self.model(data)
-            loss = criterion(preds, labels)
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=2.0, norm_type=2.0)
-            optimizer.step()
+                preds = self.model(data)
+                loss = criterion(preds, labels)
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=2.0, norm_type=2.0)
+                optimizer.step()
 
-            print(f"epoch: {iter_num // len(train_dataloader) + 1}, "
-                  f"batch: {iter_num % len (train_dataloader)}/{len(train_dataloader)}"
-                  f" loss: {loss.item():.7f} batch_time: {time.time() - start_batch}")
+                print(f"epoch: {epoch_idx},"
+                      f" batch: {batch_idx}/{len(train_dataloader)},"
+                      f" loss: {loss.item():.7f},"
+                      f" batch_time: {time.time() - start_batch}")
 
-            start_batch = time.time()
+                start_batch = time.time()
 
-            # periodically plot the accuracies on train batch
-            if iter_num % 100 == 0:
-                acc1, acc5 = AdvPreTrain.accuracy(preds, labels, topk=(1, 5))
-                wandb.log({'pretrain/acc1': acc1.item(), 'pretrain/acc5': acc5.item(),
-                           'pretrain/batch_time:': time.time() - start_batch})
+                # periodically plot the accuracies on train batch
+                if batch_idx % 200 == 0:
+                    acc1, acc5 = AdvPreTrain.accuracy(preds, labels, topk=(1, 5))
+                    wandb.log({'pretrain/acc1': acc1.item(), 'pretrain/acc5': acc5.item(),
+                               'pretrain/batch_time:': time.time() - start_batch})
 
-            # step the scheduler after an epoch
-            if (iter_num % len(train_dataloader) + 1) == len(train_dataloader):
-                scheduler.step()
+                # validate and checkpoint
+                if batch_idx % 1000:
+                    with torch.no_grad():
+                        # note this averaging is not exactly correct because of change in batch size amongst validation
+                        # but this should be good enough for validation purposes
+                        val_losses = list()
+                        val_acc1s = list()
+                        val_acc5s = list()
+                        self.model.eval()
+                        for idx, (data, labels) in enumerate(valid_dataloader):
+                            data, labels = data.float().to(DEVICE), labels.long().to(DEVICE)
+                            preds = self.model(data)
+                            acc1, acc5 = AdvPreTrain.accuracy(preds, labels, topk=(1, 5))
+                            loss = criterion(preds, labels)
+                            val_losses.append(loss.item())
+                            val_acc1s.append(acc1.item())
+                            val_acc5s.append(acc5.item())
+                        wandb.log({'pretrain/validation_loss:': np.mean(val_losses),
+                                   'pretrain/validation_acc1:': np.mean(val_acc1s),
+                                   'pretrain/validation_acc5': np.mean(val_acc5s)})
+                        self.model.train()
+                        if np.mean(val_acc1s) > best_val_acc1:
+                            best_val_acc1 = np.mean(val_acc1s)
+                            AdvPreTrain.snapshot_gpu(self.model, optimizer, scheduler,
+                                                     epoch_idx * len(train_dataloader) + batch_idx, best_val_acc1,
+                                                     self.pretrain_best_model)
 
-            # validate and checkpoint
-            if iter_num % 1000:
-                with torch.no_grad():
-                    # note this averaging is not exactly correct because of change in batch size amongst validation
-                    # but this should be good enough for validation purposes
-                    val_losses = list()
-                    val_acc1s = list()
-                    val_acc5s = list()
-                    self.model.eval()
-                    for idx, (data, labels) in enumerate(valid_dataloader):
-                        data, labels = data.float().to(DEVICE), labels.long().to(DEVICE)
-                        preds = self.model(data)
-                        acc1, acc5 = AdvPreTrain.accuracy(preds, labels, topk=(1, 5))
-                        loss = criterion(preds, labels)
-                        val_losses.append(loss.item())
-                        val_acc1s.append(acc1.item())
-                        val_acc5s.append(acc5.item())
-                    wandb.log({'pretrain/validation_loss:': np.mean(val_losses),
-                               'pretrain/validation_acc1:': np.mean(val_acc1s),
-                               'pretrain/validation_acc5': np.mean(val_acc5s)})
-                    self.model.train()
-                    if np.mean(val_acc1s) > best_val_acc1:
-                        best_val_acc1 = np.mean(val_acc1s)
-                        AdvPreTrain.snapshot_gpu(self.model, optimizer, scheduler, iter_num, best_val_acc1,
-                                                 self.pretrain_best_model)
+                    # save cur state
+                    AdvPreTrain.snapshot_gpu(self.model, optimizer, scheduler,
+                                             epoch_idx * len(train_dataloader) + batch_idx, best_val_acc1,
+                                             self.pretrain_cur_model)
 
-                # save cur state
-                AdvPreTrain.snapshot_gpu(self.model, optimizer, scheduler, iter_num, best_val_acc1,
-                                         self.pretrain_cur_model)
+            scheduler.step()
 
     def finetune(self):
         pass
