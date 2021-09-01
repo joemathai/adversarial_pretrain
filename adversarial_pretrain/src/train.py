@@ -128,10 +128,10 @@ class AdvPreTrain:
                                                                    torchvision.transforms.ToTensor()
                                                                ]))
         train_dataloader = torch.utils.data.DataLoader(pretrain_train_dataset, batch_size=batch_size,
-                                                       shuffle=True, num_workers=6, pin_memory=True, drop_last=True,
+                                                       shuffle=True, num_workers=4, pin_memory=True, drop_last=True,
                                                        worker_init_fn=lambda wid: np.random.seed(
                                                            np.random.get_state()[1][0] + wid),
-                                                       prefetch_factor=32,
+                                                       prefetch_factor=10,
                                                        persistent_workers=True
                                                        )
         pretrain_valid_dataset = torchvision.datasets.ImageNet(root=str(imagenet_root),
@@ -142,7 +142,7 @@ class AdvPreTrain:
                                                                    torchvision.transforms.ToTensor()
                                                                ]))
         valid_dataloader = torch.utils.data.DataLoader(pretrain_valid_dataset, batch_size=batch_size,
-                                                       shuffle=False, num_workers=2, pin_memory=False, drop_last=False)
+                                                       shuffle=False, num_workers=4, pin_memory=False, drop_last=False)
 
         cur_iter = 0
         best_val_acc1 = -np.inf
@@ -156,7 +156,6 @@ class AdvPreTrain:
             self.model.train()
             print(f'loaded the previous state trained to iter:{cur_iter} with best_val:{best_val_acc1}')
 
-        train_dataloader_iter = iter(train_dataloader)
         start_batch = time.time()
         cur_epoch = cur_iter // len(train_dataloader)
         for epoch_idx in range(cur_epoch, pretrain_epochs):
