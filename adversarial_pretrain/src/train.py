@@ -93,7 +93,7 @@ class AdvPreTrain:
         adversary = RandomAdvPerturbationNetwork(batch.shape, random_init=True, config=self.adversary_config).to(DEVICE)
         adv_batch = pgd_attack_linf(adversary, self.model, batch, labels, num_iterations=pgd_iterations,
                                     validator=validation, loss_fn_type='xent')
-        wandb.log({"pretrain/adv_success_rate": validation(self.model, batch, adv_batch, labels)})
+        wandb.log({"pretrain/adv_success_rate": validation(self.model, batch, adv_batch, labels)}, commit=False)
         self.model.train()
         return adv_batch
 
@@ -183,14 +183,13 @@ class AdvPreTrain:
                       f" batch: {batch_idx}/{len(train_dataloader)},"
                       f" loss: {loss.item():.7f},"
                       f" batch_time: {time.time() - start_batch}")
-
-                start_batch = time.time()
+                wandb.log({'pretrain/ce_smooth_loss': loss.item()})
 
                 # periodically plot the accuracies on train batch
                 if (batch_idx + 1) % 200 == 0:
                     acc1, acc5 = AdvPreTrain.accuracy(preds, labels, topk=(1, 5))
                     wandb.log({'pretrain/acc1': acc1.item(), 'pretrain/acc5': acc5.item(),
-                               'pretrain/batch_time:': time.time() - start_batch})
+                               'pretrain/batch_time:': time.time() - start_batch}, commit=False)
 
                 # validate and checkpoint
                 if (batch_idx + 1) % 1000 == 0:
@@ -211,19 +210,18 @@ class AdvPreTrain:
                             val_acc5s.append(acc5.item())
                         wandb.log({'pretrain/validation_loss:': np.mean(val_losses),
                                    'pretrain/validation_acc1:': np.mean(val_acc1s),
-                                   'pretrain/validation_acc5': np.mean(val_acc5s)})
+                                   'pretrain/validation_acc5': np.mean(val_acc5s)}, commit=False)
                         self.model.train()
                         if np.mean(val_acc1s) > best_val_acc1:
                             best_val_acc1 = np.mean(val_acc1s)
                             AdvPreTrain.snapshot_gpu(self.model, optimizer, scheduler,
                                                      epoch_idx * len(train_dataloader) + batch_idx, best_val_acc1,
                                                      self.pretrain_best_model)
-
                     # save cur state
                     AdvPreTrain.snapshot_gpu(self.model, optimizer, scheduler,
                                              epoch_idx * len(train_dataloader) + batch_idx, best_val_acc1,
                                              self.pretrain_cur_model)
-
+                start_batch = time.time()
             scheduler.step()
 
     def finetune(self):
