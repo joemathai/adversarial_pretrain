@@ -2,11 +2,11 @@
   "project_name": "ImageNet_pretrain",
   "exp_prefix": "ADAM",
   "model_type": "tf_efficientnetv2_s_in21k",
-  "train_type": "clean",
+  "train_type": "tps",
   "pretrain_dataset_name": "ImageNet",
   "pretrain_dataset_root": "/nas/vista-ssd01/batl/public_datasets/ImageNet",
   "pretrain_classes": 1000,
-  "pretrain_adversary": false,
+  "pretrain_adversary": true,
   "finetune_dataset": "BATL",
   "finetune_classes": 2,
   "save_path": "/nas/vista-ssd01/users/jmathai/batl",
@@ -16,7 +16,11 @@
     "SWIRColorTransforms": null,
     "AdjustHueSaturation": null,
     "SpatialFlowFields": null,
-    "ThinPlateSplines": null,
+    "ThinPlateSplines":{
+        "num_random_pts": 24,
+        "step_size": 0.1,
+        "pixel_shift_budget": 1.5
+    },
     "RotationTranslationTransforms": null,
     "ColorTransforms": null,
     "ColorTransformsCIELUV": null,
@@ -26,9 +30,6 @@
     "AdjustSharpness": null,
     "AdjustGamma": null,
     "AdjustBrightnessContrast": null,
-    "Delta": {
-      "step_size": 0.003921,
-      "linf_budget": 0.01568
-    }
+    "Delta": null
   }
 }

@@ -131,7 +131,7 @@ class AdvPreTrain:
                                                        shuffle=True, num_workers=4, pin_memory=True, drop_last=True,
                                                        worker_init_fn=lambda wid: np.random.seed(
                                                            np.random.get_state()[1][0] + wid),
-                                                       prefetch_factor=10,
+                                                       prefetch_factor=batch_size // 4,
                                                        persistent_workers=True
                                                        )
         pretrain_valid_dataset = torchvision.datasets.ImageNet(root=str(imagenet_root),
