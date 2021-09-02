@@ -9,6 +9,8 @@ import numpy as np
 import torch
 import wandb
 import torchvision
+import torch.multiprocessing as mp
+import torch.distributed as dist
 
 from functional_attacks import pgd_attack_linf, validation
 from adversarial_pretrain.src.models.timm_model_loader import MixBNModelBuilder
@@ -16,7 +18,6 @@ from adversarial_pretrain.src.models.adv_perturbation_net import RandomAdvPertur
 from adversarial_pretrain.src.utils.loss import LabelSmoothingCrossEntropy
 
 torch.backends.cudnn.benchmark = True
-DEVICE = torch.device('cuda')
 
 
 class AdvPreTrain:
@@ -40,11 +41,6 @@ class AdvPreTrain:
 
         self.exp_name = f"{self.exp_prefix}_{self.train_type}_{self.model_type}_pretrain_{self.pretrain_dataset_name}"\
                         f"_finetune_{self.finetune_dataset}"
-
-        # define model and pretraining dataset
-        self.model = MixBNModelBuilder(model_type=self.model_type, num_classes=self.pretrain_classes,
-                                       pretrained=False, mix_bn=False).to(DEVICE)
-
         base_dir = pathlib.Path(f"{self.save_path}/{self.project_name}/{self.exp_name}")
         base_dir.mkdir(parents=True, exist_ok=True)
 
@@ -88,37 +84,50 @@ class AdvPreTrain:
         scheduler.load_state_dict(snapshot['scheduler'])
         return snapshot['cur_epoch'], snapshot['best_val']
 
-    def get_adversarial_batch(self, batch, labels, pgd_iterations=5):
-        self.model.eval()
-        adversary = RandomAdvPerturbationNetwork(batch.shape, random_init=True, config=self.adversary_config).to(DEVICE)
-        adv_batch = pgd_attack_linf(adversary, self.model, batch, labels, num_iterations=pgd_iterations,
+    def get_adversarial_batch(self, model, batch, labels, pgd_iterations, device):
+        model.eval()
+        adversary = RandomAdvPerturbationNetwork(batch.shape, random_init=True, config=self.adversary_config).to(device)
+        adv_batch = pgd_attack_linf(adversary, model, batch, labels, num_iterations=pgd_iterations,
                                     validator=validation, loss_fn_type='xent')
-        wandb.log({"pretrain/adv_success_rate": validation(self.model, batch, adv_batch, labels)}, commit=False)
-        self.model.train()
+        wandb.log({"pretrain/adv_success_rate": validation(model, batch, adv_batch, labels)}, commit=False)
+        model.train()
         return adv_batch
 
-    def pretrain_imagenet(self):
+    def pretrain_imagenet(self, gpu, ngpus):
+        print(f'pretraining worker gpu/rank:{gpu} ngpus/world_size:{ngpus}')
+        dist.init_process_group(backend='nccl', rank=gpu, world_size=ngpus,
+                                init_method=str(pathlib.Path(os.getenv('TMPDIR')) / 'pytorch_dist_sharedfile'))
+
         pretrain_epochs = 100
         batch_size = 224
         pretrain_lr = 3e-4
         pretrain_wd = 1e-4
+        device = torch.device(f"cuda:{gpu}")
 
         # copy imagenet data locally
         imagenet_root = pathlib.Path(f"{os.getenv('TMPDIR')}/imagenet_data")
-        imagenet_root.mkdir(exist_ok=True, parents=True)
-        if not (imagenet_root / "ILSVRC2012_img_train.tar").is_file():
-            print('copying ImageNet train.tar to LFS')
-            shutil.copy(f"{self.config['pretrain_dataset_root']}/ILSVRC2012_img_train.tar", str(imagenet_root))
-        if not (imagenet_root / "ILSVRC2012_img_val.tar").is_file():
-            print('copying ImageNet val.tar to LFS')
-            shutil.copy(f"{self.config['pretrain_dataset_root']}/ILSVRC2012_img_val.tar", str(imagenet_root))
-        if not (imagenet_root / "ILSVRC2012_devkit_t12.tar.gz").is_file():
-            print('copying ImageNet devkit.tar to LFS')
-            shutil.copy(f"{self.config['pretrain_dataset_root']}/ILSVRC2012_devkit_t12.tar.gz",
-                        str(imagenet_root))
-        if not (imagenet_root / "meta.bin").is_file():
-            shutil.copy(f"{self.config['pretrain_dataset_root']}/meta.bin",
-                        str(imagenet_root))
+        if gpu == 0:
+            imagenet_root.mkdir(exist_ok=True, parents=True)
+            if not (imagenet_root / "ILSVRC2012_img_train.tar").is_file():
+                print('copying ImageNet train.tar to LFS')
+                shutil.copy(f"{self.config['pretrain_dataset_root']}/ILSVRC2012_img_train.tar", str(imagenet_root))
+            if not (imagenet_root / "ILSVRC2012_img_val.tar").is_file():
+                print('copying ImageNet val.tar to LFS')
+                shutil.copy(f"{self.config['pretrain_dataset_root']}/ILSVRC2012_img_val.tar", str(imagenet_root))
+            if not (imagenet_root / "ILSVRC2012_devkit_t12.tar.gz").is_file():
+                print('copying ImageNet devkit.tar to LFS')
+                shutil.copy(f"{self.config['pretrain_dataset_root']}/ILSVRC2012_devkit_t12.tar.gz",
+                            str(imagenet_root))
+            if not (imagenet_root / "meta.bin").is_file():
+                shutil.copy(f"{self.config['pretrain_dataset_root']}/meta.bin",
+                            str(imagenet_root))
+
+        dist.barrier()  # wait for gpu:0 to copy the files to disk
+
+        # setup the model
+        model = MixBNModelBuilder(model_type=self.model_type, num_classes=self.pretrain_classes,
+                                  pretrained=False, mix_bn=False).to(device)
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
 
         pretrain_train_dataset = torchvision.datasets.ImageNet(root=str(imagenet_root),
                                                                split="train",
@@ -127,12 +136,14 @@ class AdvPreTrain:
                                                                    torchvision.transforms.RandomHorizontalFlip(),
                                                                    torchvision.transforms.ToTensor()
                                                                ]))
+        train_sampler = torch.utils.data.distributed.DistributedSampler(pretrain_train_dataset)
         train_dataloader = torch.utils.data.DataLoader(pretrain_train_dataset, batch_size=batch_size,
                                                        shuffle=True, num_workers=4, pin_memory=True, drop_last=True,
                                                        worker_init_fn=lambda wid: np.random.seed(
                                                            np.random.get_state()[1][0] + wid),
                                                        prefetch_factor=batch_size // 4,
-                                                       persistent_workers=True
+                                                       persistent_workers=True,
+                                                       sampler=train_sampler
                                                        )
         pretrain_valid_dataset = torchvision.datasets.ImageNet(root=str(imagenet_root),
                                                                split="val",
@@ -147,20 +158,21 @@ class AdvPreTrain:
         cur_iter = 0
         best_val_acc1 = -np.inf
         criterion = LabelSmoothingCrossEntropy(smoothing=0.1)
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=pretrain_lr, weight_decay=pretrain_wd)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=pretrain_lr, weight_decay=pretrain_wd)
         scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[80, 95], gamma=0.1)
 
         if self.pretrain_cur_model.is_file():
-            cur_iter, best_val_acc1 = AdvPreTrain.load_snapshot(self.model, optimizer, scheduler,
-                                                                self.pretrain_cur_model, device=DEVICE)
-            self.model.train()
+            cur_iter, best_val_acc1 = AdvPreTrain.load_snapshot(model, optimizer, scheduler,
+                                                                self.pretrain_cur_model, device=device)
+            model.train()
             print(f'loaded the previous state trained to iter:{cur_iter} with best_val:{best_val_acc1}')
 
         start_batch = time.time()
         cur_epoch = cur_iter // len(train_dataloader)
         for epoch_idx in range(cur_epoch, pretrain_epochs):
+            dist.barrier()
             for batch_idx, (data, labels) in enumerate(train_dataloader):
-                data, labels = data.float().to(DEVICE, non_blocking=True), labels.long().to(DEVICE, non_blocking=True)
+                data, labels = data.float().to(device, non_blocking=True), labels.long().to(device, non_blocking=True)
 
                 # this is guarantee more or less everything is trained to equal amounts
                 if cur_iter % len(train_dataloader) + batch_idx > len(train_dataloader):
@@ -168,15 +180,16 @@ class AdvPreTrain:
 
                 if self.pretrain_adversary:
                     half_batch_size = data.shape[0] // 2
-                    half_adv_batch = self.get_adversarial_batch(data[half_batch_size:], labels[half_batch_size:])
+                    half_adv_batch = self.get_adversarial_batch(model, data[half_batch_size:], labels[half_batch_size:],
+                                                                pgd_iterations=5, device=device)
                     with torch.no_grad():
                         data[half_batch_size:].copy_(half_adv_batch)
 
-                preds = self.model(data)
+                preds = model(data)
                 loss = criterion(preds, labels)
                 optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=2.0, norm_type=2.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0, norm_type=2.0)
                 optimizer.step()
 
                 print(f"epoch: {epoch_idx},"
@@ -192,17 +205,17 @@ class AdvPreTrain:
                                'pretrain/batch_time:': time.time() - start_batch}, commit=False)
 
                 # validate and checkpoint
-                if (batch_idx + 1) % 1000 == 0:
+                if gpu == 0 and (batch_idx + 1) % 1000 == 0:
                     with torch.no_grad():
                         # note this averaging is not exactly correct because of change in batch size amongst validation
                         # but this should be good enough for validation purposes
                         val_losses = list()
                         val_acc1s = list()
                         val_acc5s = list()
-                        self.model.eval()
+                        model.eval()
                         for idx, (data, labels) in enumerate(valid_dataloader):
                             data, labels = data.float().to(DEVICE), labels.long().to(DEVICE)
-                            preds = self.model(data)
+                            preds = model(data)
                             acc1, acc5 = AdvPreTrain.accuracy(preds, labels, topk=(1, 5))
                             loss = criterion(preds, labels)
                             val_losses.append(loss.item())
@@ -211,14 +224,14 @@ class AdvPreTrain:
                         wandb.log({'pretrain/validation_loss:': np.mean(val_losses),
                                    'pretrain/validation_acc1:': np.mean(val_acc1s),
                                    'pretrain/validation_acc5': np.mean(val_acc5s)}, commit=False)
-                        self.model.train()
+                        model.train()
                         if np.mean(val_acc1s) > best_val_acc1:
                             best_val_acc1 = np.mean(val_acc1s)
-                            AdvPreTrain.snapshot_gpu(self.model, optimizer, scheduler,
+                            AdvPreTrain.snapshot_gpu(model, optimizer, scheduler,
                                                      epoch_idx * len(train_dataloader) + batch_idx, best_val_acc1,
                                                      self.pretrain_best_model)
                     # save cur state
-                    AdvPreTrain.snapshot_gpu(self.model, optimizer, scheduler,
+                    AdvPreTrain.snapshot_gpu(model, optimizer, scheduler,
                                              epoch_idx * len(train_dataloader) + batch_idx, best_val_acc1,
                                              self.pretrain_cur_model)
                 start_batch = time.time()
@@ -227,15 +240,22 @@ class AdvPreTrain:
     def finetune(self):
         pass
 
+    def __call__(self, gpu, ngpus):
+        self.pretrain_imagenet(gpu, ngpus)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Parser for BATL adv. training')
     parser.add_argument('--config', type=str, required=True)
+    parser.add_argument('--ngpus', type=int, default=1)
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
         print('cuda is not available exiting....')
         exit(1)
 
-    trainer = AdvPreTrain(args.config)
-    trainer.pretrain_imagenet()
+    if torch.cuda.device_count() != args.ngpus:
+        print("cuda device count and input gpu count mismatch")
+        exit(1)
+
+    mp.spawn(AdvPreTrain(args.config), nprocs=args.ngpus, args=(args.ngpus,))
