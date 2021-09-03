@@ -3,7 +3,6 @@ from functools import partial
 import timm
 import torch
 import torch.nn as nn
-from torchinfo import summary
 
 
 def to_status(m, status):
@@ -103,7 +102,6 @@ class MixBNModelBuilder(torch.nn.Module):
     def __init__(self, model_type, num_classes=2, pretrained=True, mix_bn=False, mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)):
         super().__init__()
         self.model = timm.create_model(model_type, pretrained=pretrained, num_classes=num_classes)
-        summary(self.model)
         if mix_bn:
             print("replacing the BatchNorm2d with MixBatchNorm2d")
             self.replace_bn_layers(self.model)

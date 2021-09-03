@@ -11,6 +11,7 @@ import wandb
 import torchvision
 import torch.multiprocessing as mp
 import torch.distributed as dist
+from torchinfo import summary
 
 from functional_attacks import pgd_attack_linf, validation
 from adversarial_pretrain.src.models.timm_model_loader import MixBNModelBuilder
@@ -124,7 +125,7 @@ class AdvPreTrain:
             # unpack the data using torchvision dataset utils
             torchvision.datasets.ImageNet(root=str(imagenet_root), split="train")
             torchvision.datasets.ImageNet(root=str(imagenet_root), split="val")
-        
+
         dist.barrier()  # wait for gpu:0 to copy the files to unpack them
         pretrain_train_dataset = torchvision.datasets.ImageFolder(str(imagenet_root / 'train'),
                                                                   transform=torchvision.transforms.Compose([
@@ -143,6 +144,11 @@ class AdvPreTrain:
                                   pretrained=False, mix_bn=False).to(device)
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
 
+        # print model architecture
+        if gpu == 0:
+            summary(model)
+
+        # setup the dataloader
         train_sampler = torch.utils.data.distributed.DistributedSampler(pretrain_train_dataset, rank=gpu, shuffle=True, drop_last=True)
         train_dataloader = torch.utils.data.DataLoader(pretrain_train_dataset, batch_size=batch_size,
                                                        num_workers=4, pin_memory=True,
@@ -175,7 +181,6 @@ class AdvPreTrain:
             if (iter_idx + 1) % len(train_dataloader) == 0:
                 scheduler.step()
                 train_sampler.set_epoch(iter_idx / len(train_dataloader))
-                dist.barrier()
 
             try:
                 data, labels = next(train_dataloader_iterator)
@@ -200,7 +205,7 @@ class AdvPreTrain:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0, norm_type=2.0)
             optimizer.step()
 
-            print(f"gpu: {gpu}/{ngpus} epoch: {iter_idx / len(train_dataloader)},"
+            print(f"gpu: {gpu}/{ngpus} epoch: {iter_idx + 1 // len(train_dataloader)},"
                   f" batch: {iter_idx % len(train_dataloader)}/{len(train_dataloader)},"
                   f" loss: {loss.item():.7f},"
                   f" batch_time: {time.time() - start_batch}"
@@ -217,9 +222,10 @@ class AdvPreTrain:
                            'pretrain/batch_time:': time.time() - start_batch}, commit=False)
 
             # validate and checkpoint
-            if (iter_idx + 1) % 500 == 0:
+            if (iter_idx + 1) % 1000 == 0:
                 # if rank 0 then do validation
                 if gpu == 0:
+                    print(f'gpu:{gpu} running validation')
                     with torch.no_grad():
                         # note this averaging is not exactly correct because of change in batch size amongst validation
                         # but this should be good enough for validation purposes
@@ -229,9 +235,13 @@ class AdvPreTrain:
                         model.eval()
                         for idx, (data, labels) in enumerate(valid_dataloader):
                             data, labels = data.float().to(device), labels.long().to(device)
-                            preds = model(data)
+                            # note: validate using model.module because for some reason the forward pass on a DDP model here causes
+                            # the barrier not to work at the end of validation
+                            preds = model.module(data)
                             acc1, acc5 = self.accuracy(preds, labels, topk=(1, 5))
                             loss = criterion(preds, labels)
+                            print(f"validation idx:{idx + 1}/{len(valid_dataloader)} loss:{loss.item()}, "
+                                  f"acc1:{acc1.item()}, acc5:{acc5.item()}")
                             val_losses.append(loss.item())
                             val_acc1s.append(acc1.item())
                             val_acc5s.append(acc5.item())
@@ -241,9 +251,11 @@ class AdvPreTrain:
                         model.train()
                         if np.mean(val_acc1s) > best_val_acc1:
                             best_val_acc1 = np.mean(val_acc1s)
-                            self.snapshot_gpu(model, optimizer, scheduler, iter_idx, best_val_acc1, self.pretrain_best_model)
+                            self.snapshot_gpu(model, optimizer, scheduler, iter_idx + 1, best_val_acc1, self.pretrain_best_model)
                     # save cur state
-                    self.snapshot_gpu(model, optimizer, scheduler, iter_idx, best_val_acc1, self.pretrain_cur_model)
+                    self.snapshot_gpu(model, optimizer, scheduler, iter_idx + 1, best_val_acc1, self.pretrain_cur_model)
+
+                entry_time = time.time()
                 dist.barrier() # wait for all other ranks to get to this point
 
             start_batch = time.time()
