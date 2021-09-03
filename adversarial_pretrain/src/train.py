@@ -11,7 +11,6 @@ import wandb
 import torchvision
 import torch.multiprocessing as mp
 import torch.distributed as dist
-from torchvision.datasets.utils import extract_archive
 
 from functional_attacks import pgd_attack_linf, validation
 from adversarial_pretrain.src.models.timm_model_loader import MixBNModelBuilder
@@ -122,20 +121,9 @@ class AdvPreTrain:
             if not (imagenet_root / "meta.bin").is_file():
                 shutil.copy(f"{self.config['pretrain_dataset_root']}/meta.bin",
                             str(imagenet_root))
-            torchvision.datasets.ImageNet(root=str(imagenet_root),
-                                          split="train",
-                                          transform=torchvision.transforms.Compose([
-                                              torchvision.transforms.RandomResizedCrop(224),
-                                              torchvision.transforms.RandomHorizontalFlip(),
-                                              torchvision.transforms.ToTensor()
-                                          ]))
-            torchvision.datasets.ImageNet(root=str(imagenet_root),
-                                          split="val",
-                                          transform=torchvision.transforms.Compose([
-                                              torchvision.transforms.Resize(256),
-                                              torchvision.transforms.CenterCrop(224),
-                                              torchvision.transforms.ToTensor()
-                                          ]))
+            # unpack the data using torchvision dataset utils
+            torchvision.datasets.ImageNet(root=str(imagenet_root), split="train")
+            torchvision.datasets.ImageNet(root=str(imagenet_root), split="val")
         
         dist.barrier()  # wait for gpu:0 to copy the files to unpack them
         pretrain_train_dataset = torchvision.datasets.ImageFolder(str(imagenet_root / 'train'),
@@ -179,49 +167,59 @@ class AdvPreTrain:
             print(f'gpu:{gpu} loaded the previous state trained to iter:{cur_iter} with best_val:{best_val_acc1}')
 
         start_batch = time.time()
-        cur_epoch = cur_iter // len(train_dataloader)
         adv_success_rate = 0.0
-        for epoch_idx in range(cur_epoch, pretrain_epochs):
-            dist.barrier()
-            for batch_idx, (data, labels) in enumerate(train_dataloader):
-                data, labels = data.float().to(device, non_blocking=True), labels.long().to(device, non_blocking=True)
+        train_dataloader_iterator = iter(train_dataloader)
+        for iter_idx in range(cur_iter, len(train_dataloader) * pretrain_epochs):
 
-                # this is guarantee more or less everything is trained to equal amounts
-                if cur_iter % len(train_dataloader) + batch_idx > len(train_dataloader):
-                    break
+            # for every epoch
+            if (iter_idx + 1) % len(train_dataloader) == 0:
+                scheduler.step()
+                train_sampler.set_epoch(iter_idx / len(train_dataloader))
+                dist.barrier()
 
-                if self.pretrain_adversary:
-                    half_batch_size = data.shape[0] // 2
-                    half_adv_batch, adv_success_rate = self.get_adversarial_batch(model, data[half_batch_size:], labels[half_batch_size:],
-                                                                                  pgd_iterations=5, device=device)
-                    with torch.no_grad():
-                        data[half_batch_size:].copy_(half_adv_batch)
+            try:
+                data, labels = next(train_dataloader_iterator)
+            except StopIteration as err:
+                train_dataloader_iterator = iter(train_dataloader)
+                data, labels = next(train_dataloader_iterator)
 
-                preds = model(data)
-                loss = criterion(preds, labels)
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0, norm_type=2.0)
-                optimizer.step()
+            data, labels = data.float().to(device, non_blocking=True), labels.long().to(device, non_blocking=True)
 
-                print(f"gpu: {gpu}/{ngpus} epoch: {epoch_idx},"
-                      f" batch: {batch_idx}/{len(train_dataloader)},"
-                      f" loss: {loss.item():.7f},"
-                      f" batch_time: {time.time() - start_batch}"
-                      f" adv_success_rate: {adv_success_rate}")
+            if self.pretrain_adversary:
+                half_batch_size = data.shape[0] // 2
+                half_adv_batch, adv_success_rate = self.get_adversarial_batch(model, data[half_batch_size:],
+                                                                              labels[half_batch_size:],
+                                                                              pgd_iterations=5, device=device)
+                with torch.no_grad():
+                    data[half_batch_size:].copy_(half_adv_batch)
 
+            preds = model(data)
+            loss = criterion(preds, labels)
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0, norm_type=2.0)
+            optimizer.step()
+
+            print(f"gpu: {gpu}/{ngpus} epoch: {iter_idx / len(train_dataloader)},"
+                  f" batch: {iter_idx % len(train_dataloader)}/{len(train_dataloader)},"
+                  f" loss: {loss.item():.7f},"
+                  f" batch_time: {time.time() - start_batch}"
+                  f" adv_success_rate: {adv_success_rate}")
+
+            if gpu == 0:
+                wandb.log({'pretrain/ce_smooth_loss': loss.item(),
+                           'pretrain/adv_success_rate': adv_success_rate})
+
+            # periodically plot the accuracies on train batch
+            if gpu == 0 and (iter_idx + 1) % 200 == 0:
+                acc1, acc5 = self.accuracy(preds, labels, topk=(1, 5))
+                wandb.log({'pretrain/acc1': acc1.item(), 'pretrain/acc5': acc5.item(),
+                           'pretrain/batch_time:': time.time() - start_batch}, commit=False)
+
+            # validate and checkpoint
+            if (iter_idx + 1) % 500 == 0:
+                # if rank 0 then do validation
                 if gpu == 0:
-                    wandb.log({'pretrain/ce_smooth_loss': loss.item(),
-                               'pretrain/adv_success_rate': adv_success_rate})
-
-                # periodically plot the accuracies on train batch
-                if gpu == 0 and (batch_idx + 1) % 200 == 0:
-                    acc1, acc5 = self.accuracy(preds, labels, topk=(1, 5))
-                    wandb.log({'pretrain/acc1': acc1.item(), 'pretrain/acc5': acc5.item(),
-                               'pretrain/batch_time:': time.time() - start_batch}, commit=False)
-
-                # validate and checkpoint
-                if gpu == 0 and (batch_idx + 1) % 1000 == 0:
                     with torch.no_grad():
                         # note this averaging is not exactly correct because of change in batch size amongst validation
                         # but this should be good enough for validation purposes
@@ -243,15 +241,12 @@ class AdvPreTrain:
                         model.train()
                         if np.mean(val_acc1s) > best_val_acc1:
                             best_val_acc1 = np.mean(val_acc1s)
-                            self.snapshot_gpu(model, optimizer, scheduler,
-                                                     epoch_idx * len(train_dataloader) + batch_idx, best_val_acc1,
-                                                     self.pretrain_best_model)
+                            self.snapshot_gpu(model, optimizer, scheduler, iter_idx, best_val_acc1, self.pretrain_best_model)
                     # save cur state
-                    self.snapshot_gpu(model, optimizer, scheduler,
-                                      epoch_idx * len(train_dataloader) + batch_idx, best_val_acc1,
-                                      self.pretrain_cur_model)
-                start_batch = time.time()
-            scheduler.step()
+                    self.snapshot_gpu(model, optimizer, scheduler, iter_idx, best_val_acc1, self.pretrain_cur_model)
+                dist.barrier() # wait for all other ranks to get to this point
+
+            start_batch = time.time()
 
     def finetune(self):
         pass
