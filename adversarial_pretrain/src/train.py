@@ -11,6 +11,7 @@ import wandb
 import torchvision
 import torch.multiprocessing as mp
 import torch.distributed as dist
+from torchvision.datasets.utils import extract_archive
 
 from functional_attacks import pgd_attack_linf, validation
 from adversarial_pretrain.src.models.timm_model_loader import MixBNModelBuilder
@@ -49,9 +50,9 @@ class AdvPreTrain:
         self.finetune_cur_model = base_dir / "finetune_cur.pth"
         self.finetune_best_model = base_dir / "finetune_best.pth"
 
-        # initialize wandb
-        self.wandb_run = wandb.init(project=self.project_name, dir=os.getenv('TMPDIR'),
-                                    name=self.exp_name, id=self.exp_name, reinit=True, resume=True)
+    @staticmethod
+    def worker_init(wid):
+        return np.random.seed(np.random.get_state()[1][0] + wid)
 
     @staticmethod
     @torch.no_grad()
@@ -89,14 +90,13 @@ class AdvPreTrain:
         adversary = RandomAdvPerturbationNetwork(batch.shape, random_init=True, config=self.adversary_config).to(device)
         adv_batch = pgd_attack_linf(adversary, model, batch, labels, num_iterations=pgd_iterations,
                                     validator=validation, loss_fn_type='xent')
-        wandb.log({"pretrain/adv_success_rate": validation(model, batch, adv_batch, labels)}, commit=False)
+        success_rate = validation(model, batch, adv_batch, labels)
         model.train()
-        return adv_batch
+        return adv_batch, success_rate
 
     def pretrain_imagenet(self, gpu, ngpus):
         print(f'pretraining worker gpu/rank:{gpu} ngpus/world_size:{ngpus}')
-        dist.init_process_group(backend='nccl', rank=gpu, world_size=ngpus,
-                                init_method=str(pathlib.Path(os.getenv('TMPDIR')) / 'pytorch_dist_sharedfile'))
+        dist.init_process_group(backend='nccl', rank=gpu, world_size=ngpus)
 
         pretrain_epochs = 100
         batch_size = 224
@@ -107,6 +107,7 @@ class AdvPreTrain:
         # copy imagenet data locally
         imagenet_root = pathlib.Path(f"{os.getenv('TMPDIR')}/imagenet_data")
         if gpu == 0:
+            wandb.init(project=self.project_name, dir=os.getenv('TMPDIR'), name=self.exp_name, id=self.exp_name, reinit=True, resume=True)
             imagenet_root.mkdir(exist_ok=True, parents=True)
             if not (imagenet_root / "ILSVRC2012_img_train.tar").is_file():
                 print('copying ImageNet train.tar to LFS')
@@ -121,37 +122,47 @@ class AdvPreTrain:
             if not (imagenet_root / "meta.bin").is_file():
                 shutil.copy(f"{self.config['pretrain_dataset_root']}/meta.bin",
                             str(imagenet_root))
-
-        dist.barrier()  # wait for gpu:0 to copy the files to disk
-
+            torchvision.datasets.ImageNet(root=str(imagenet_root),
+                                          split="train",
+                                          transform=torchvision.transforms.Compose([
+                                              torchvision.transforms.RandomResizedCrop(224),
+                                              torchvision.transforms.RandomHorizontalFlip(),
+                                              torchvision.transforms.ToTensor()
+                                          ]))
+            torchvision.datasets.ImageNet(root=str(imagenet_root),
+                                          split="val",
+                                          transform=torchvision.transforms.Compose([
+                                              torchvision.transforms.Resize(256),
+                                              torchvision.transforms.CenterCrop(224),
+                                              torchvision.transforms.ToTensor()
+                                          ]))
+        
+        dist.barrier()  # wait for gpu:0 to copy the files to unpack them
+        pretrain_train_dataset = torchvision.datasets.ImageFolder(str(imagenet_root / 'train'),
+                                                                  transform=torchvision.transforms.Compose([
+                                                                      torchvision.transforms.RandomResizedCrop(224),
+                                                                      torchvision.transforms.RandomHorizontalFlip(),
+                                                                      torchvision.transforms.ToTensor()
+                                                                  ]))
+        pretrain_valid_dataset = torchvision.datasets.ImageFolder(str(imagenet_root / 'val'),
+                                                                  transform=torchvision.transforms.Compose([
+                                                                      torchvision.transforms.Resize(256),
+                                                                      torchvision.transforms.CenterCrop(224),
+                                                                      torchvision.transforms.ToTensor()
+                                                                  ]))
         # setup the model
         model = MixBNModelBuilder(model_type=self.model_type, num_classes=self.pretrain_classes,
                                   pretrained=False, mix_bn=False).to(device)
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
 
-        pretrain_train_dataset = torchvision.datasets.ImageNet(root=str(imagenet_root),
-                                                               split="train",
-                                                               transform=torchvision.transforms.Compose([
-                                                                   torchvision.transforms.RandomResizedCrop(224),
-                                                                   torchvision.transforms.RandomHorizontalFlip(),
-                                                                   torchvision.transforms.ToTensor()
-                                                               ]))
-        train_sampler = torch.utils.data.distributed.DistributedSampler(pretrain_train_dataset)
+        train_sampler = torch.utils.data.distributed.DistributedSampler(pretrain_train_dataset, rank=gpu, shuffle=True, drop_last=True)
         train_dataloader = torch.utils.data.DataLoader(pretrain_train_dataset, batch_size=batch_size,
-                                                       shuffle=True, num_workers=4, pin_memory=True, drop_last=True,
-                                                       worker_init_fn=lambda wid: np.random.seed(
-                                                           np.random.get_state()[1][0] + wid),
+                                                       num_workers=4, pin_memory=True,
+                                                       worker_init_fn=self.worker_init,
                                                        prefetch_factor=batch_size // 4,
                                                        persistent_workers=True,
                                                        sampler=train_sampler
                                                        )
-        pretrain_valid_dataset = torchvision.datasets.ImageNet(root=str(imagenet_root),
-                                                               split="val",
-                                                               transform=torchvision.transforms.Compose([
-                                                                   torchvision.transforms.Resize(256),
-                                                                   torchvision.transforms.CenterCrop(224),
-                                                                   torchvision.transforms.ToTensor()
-                                                               ]))
         valid_dataloader = torch.utils.data.DataLoader(pretrain_valid_dataset, batch_size=batch_size,
                                                        shuffle=False, num_workers=4, pin_memory=False, drop_last=False)
 
@@ -162,13 +173,14 @@ class AdvPreTrain:
         scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[80, 95], gamma=0.1)
 
         if self.pretrain_cur_model.is_file():
-            cur_iter, best_val_acc1 = AdvPreTrain.load_snapshot(model, optimizer, scheduler,
-                                                                self.pretrain_cur_model, device=device)
+            cur_iter, best_val_acc1 = self.load_snapshot(model, optimizer, scheduler,
+                                                         self.pretrain_cur_model, device=device)
             model.train()
-            print(f'loaded the previous state trained to iter:{cur_iter} with best_val:{best_val_acc1}')
+            print(f'gpu:{gpu} loaded the previous state trained to iter:{cur_iter} with best_val:{best_val_acc1}')
 
         start_batch = time.time()
         cur_epoch = cur_iter // len(train_dataloader)
+        adv_success_rate = 0.0
         for epoch_idx in range(cur_epoch, pretrain_epochs):
             dist.barrier()
             for batch_idx, (data, labels) in enumerate(train_dataloader):
@@ -180,8 +192,8 @@ class AdvPreTrain:
 
                 if self.pretrain_adversary:
                     half_batch_size = data.shape[0] // 2
-                    half_adv_batch = self.get_adversarial_batch(model, data[half_batch_size:], labels[half_batch_size:],
-                                                                pgd_iterations=5, device=device)
+                    half_adv_batch, adv_success_rate = self.get_adversarial_batch(model, data[half_batch_size:], labels[half_batch_size:],
+                                                                                  pgd_iterations=5, device=device)
                     with torch.no_grad():
                         data[half_batch_size:].copy_(half_adv_batch)
 
@@ -192,15 +204,19 @@ class AdvPreTrain:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0, norm_type=2.0)
                 optimizer.step()
 
-                print(f"epoch: {epoch_idx},"
+                print(f"gpu: {gpu}/{ngpus} epoch: {epoch_idx},"
                       f" batch: {batch_idx}/{len(train_dataloader)},"
                       f" loss: {loss.item():.7f},"
-                      f" batch_time: {time.time() - start_batch}")
-                wandb.log({'pretrain/ce_smooth_loss': loss.item()})
+                      f" batch_time: {time.time() - start_batch}"
+                      f" adv_success_rate: {adv_success_rate}")
+
+                if gpu == 0:
+                    wandb.log({'pretrain/ce_smooth_loss': loss.item(),
+                               'pretrain/adv_success_rate': adv_success_rate})
 
                 # periodically plot the accuracies on train batch
-                if (batch_idx + 1) % 200 == 0:
-                    acc1, acc5 = AdvPreTrain.accuracy(preds, labels, topk=(1, 5))
+                if gpu == 0 and (batch_idx + 1) % 200 == 0:
+                    acc1, acc5 = self.accuracy(preds, labels, topk=(1, 5))
                     wandb.log({'pretrain/acc1': acc1.item(), 'pretrain/acc5': acc5.item(),
                                'pretrain/batch_time:': time.time() - start_batch}, commit=False)
 
@@ -214,9 +230,9 @@ class AdvPreTrain:
                         val_acc5s = list()
                         model.eval()
                         for idx, (data, labels) in enumerate(valid_dataloader):
-                            data, labels = data.float().to(DEVICE), labels.long().to(DEVICE)
+                            data, labels = data.float().to(device), labels.long().to(device)
                             preds = model(data)
-                            acc1, acc5 = AdvPreTrain.accuracy(preds, labels, topk=(1, 5))
+                            acc1, acc5 = self.accuracy(preds, labels, topk=(1, 5))
                             loss = criterion(preds, labels)
                             val_losses.append(loss.item())
                             val_acc1s.append(acc1.item())
@@ -227,13 +243,13 @@ class AdvPreTrain:
                         model.train()
                         if np.mean(val_acc1s) > best_val_acc1:
                             best_val_acc1 = np.mean(val_acc1s)
-                            AdvPreTrain.snapshot_gpu(model, optimizer, scheduler,
+                            self.snapshot_gpu(model, optimizer, scheduler,
                                                      epoch_idx * len(train_dataloader) + batch_idx, best_val_acc1,
                                                      self.pretrain_best_model)
                     # save cur state
-                    AdvPreTrain.snapshot_gpu(model, optimizer, scheduler,
-                                             epoch_idx * len(train_dataloader) + batch_idx, best_val_acc1,
-                                             self.pretrain_cur_model)
+                    self.snapshot_gpu(model, optimizer, scheduler,
+                                      epoch_idx * len(train_dataloader) + batch_idx, best_val_acc1,
+                                      self.pretrain_cur_model)
                 start_batch = time.time()
             scheduler.step()
 
@@ -258,4 +274,6 @@ if __name__ == "__main__":
         print("cuda device count and input gpu count mismatch")
         exit(1)
 
+    os.environ['MASTER_ADDR'] = '127.0.0.1'
+    os.environ['MASTER_PORT'] = '8888'
     mp.spawn(AdvPreTrain(args.config), nprocs=args.ngpus, args=(args.ngpus,))
