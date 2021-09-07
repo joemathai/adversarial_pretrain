@@ -1,5 +1,5 @@
 {
-  "project_name": "ImageNet_pretrain",
+  "project_name": "ImageNet_pretrain_dist",
   "exp_prefix": "ADAM",
   "model_type": "tf_efficientnetv2_s_in21k",
   "train_type": "delta",
