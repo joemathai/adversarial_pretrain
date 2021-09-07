@@ -17,6 +17,10 @@ def save_mem_collate_fc(batch):
     return default_collate(batch.pop())
 
 
+def worker_init(wid):
+    return np.random.seed(np.random.get_state()[1][0] + wid)
+
+
 def square_face_detector(device: (None, str) = None, flexible: bool = True):
     face_detector = FaceAlignmentSingleFaceDetector(
         params={'device': device,  # -> Use gpu if available.
@@ -120,7 +124,8 @@ def _get_data(db_directories, gt_files, db_partitions, data_type="COLOR", batch_
                     dataset=tmp_patch_dataset, batch_size=batch_size,
                     shuffle=(idx == 0), pin_memory=True,
                     num_workers=num_workers, drop_last=(idx == 0),
-                    worker_init_fn=lambda wid: np.random.seed(np.random.get_state()[1][0] + wid)
+                    worker_init_fn=worker_init,
+                    persistent_workers=True
                 )
             )
 
@@ -136,7 +141,8 @@ def _get_data(db_directories, gt_files, db_partitions, data_type="COLOR", batch_
                         batch_size=batch_size,
                         drop_last=(idx == 0)),
                     num_workers=num_workers,
-                    worker_init_fn=lambda wid: np.random.seed(np.random.get_state()[1][0] + wid)
+                    worker_init_fn=worker_init,
+                    persistent_workers=True
                 )
             )
 

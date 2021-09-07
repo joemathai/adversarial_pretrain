@@ -85,9 +85,9 @@ class AdvPreTrain:
                     'best_val': best_val}, path)
 
     @staticmethod
-    def load_snapshot(model, optimizer, scheduler, path, device):
+    def load_snapshot(model, optimizer, scheduler, path, device, strict=True):
         snapshot = torch.load(path, map_location=device)
-        model.load_state_dict(snapshot['model'])
+        model.load_state_dict(snapshot['model'], strict=strict)
         if optimizer is not None:
             optimizer.load_state_dict(snapshot['optimizer'])
         if scheduler is not None:
@@ -105,9 +105,7 @@ class AdvPreTrain:
 
     def pretrain_imagenet(self, gpu, ngpus):
         print(f'pretraining worker gpu/rank:{gpu} ngpus/world_size:{ngpus}')
-        dist.init_process_group(backend='nccl', rank=gpu, world_size=ngpus)
-
-        pretrain_epochs = 100
+        pretrain_epochs = 5
         batch_size = 224
         pretrain_lr = 3e-4
         pretrain_wd = 1e-4
@@ -133,8 +131,10 @@ class AdvPreTrain:
             # unpack the data using torchvision dataset utils
             torchvision.datasets.ImageNet(root=str(imagenet_root), split="train")
             torchvision.datasets.ImageNet(root=str(imagenet_root), split="val")
-
-        dist.barrier()  # wait for gpu:0 to copy the files to unpack them
+            
+        print(f"gpu:{gpu} waiting for ImageNet dataset to be unzipped")
+        dist.barrier(device_ids=[gpu])  # wait for gpu:0 to copy the files to unpack them
+        print(f"gpu:{gpu} done with ImageNet dataset processing")
         pretrain_train_dataset = torchvision.datasets.ImageFolder(str(imagenet_root / 'train'),
                                                                   transform=torchvision.transforms.Compose([
                                                                       torchvision.transforms.RandomResizedCrop(224),
@@ -188,7 +188,7 @@ class AdvPreTrain:
             # for every epoch
             if (iter_idx + 1) % len(train_dataloader) == 0:
                 scheduler.step()
-                train_sampler.set_epoch(iter_idx / len(train_dataloader))
+                train_sampler.set_epoch(iter_idx // len(train_dataloader))
 
             try:
                 data, labels = next(train_dataloader_iterator)
@@ -213,13 +213,12 @@ class AdvPreTrain:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0, norm_type=2.0)
             optimizer.step()
 
-            print(f"gpu: {gpu}/{ngpus} epoch: {iter_idx + 1 // len(train_dataloader)},"
-                  f" batch: {iter_idx % len(train_dataloader)}/{len(train_dataloader)},"
-                  f" loss: {loss.item():.7f},"
-                  f" batch_time: {time.time() - start_batch}"
-                  f" adv_success_rate: {adv_success_rate}")
-
             if gpu == 0:
+                print(f"gpu: {gpu}/{ngpus} epoch: {(iter_idx + 1) // len(train_dataloader)},"
+                      f" batch: {iter_idx % len(train_dataloader)}/{len(train_dataloader)},"
+                      f" loss: {loss.item():.7f},"
+                      f" batch_time: {time.time() - start_batch}"
+                      f" adv_success_rate: {adv_success_rate}")
                 wandb.log({'pretrain/ce_smooth_loss': loss.item(),
                            'pretrain/adv_success_rate': adv_success_rate})
 
@@ -230,7 +229,7 @@ class AdvPreTrain:
                            'pretrain/batch_time:': time.time() - start_batch}, commit=False)
 
             # validate and checkpoint
-            if (iter_idx + 1) % 1000 == 0:
+            if (iter_idx + 1) % 1000 == 0 or (iter_idx  % (len(train_dataloader) - 1)) == 0:
                 # if rank 0 then do validation
                 if gpu == 0:
                     print(f'gpu:{gpu} running validation')
@@ -266,14 +265,19 @@ class AdvPreTrain:
                     self.snapshot_gpu(model, optimizer, scheduler, iter_idx + 1, np.mean(val_acc1s),
                                       self.pretrain_cur_model)
 
-                dist.barrier()  # wait for all other ranks to get to this point
+                print(f"gpu:{gpu} waiting on validation barrier")
+                dist.barrier(device_ids=[gpu])  # wait for all other ranks to get to this point
+                print(f"gpu:{gpu} done with validation barrier")
 
             start_batch = time.time()
+            
+        return 0
 
     def finetune(self, train_dataset, gpu=0):
-        device = torch.device('cuda:{gpu}')
-        finetune_epochs = 50
-        lr = 1e-4
+        print(f'gpu:{gpu} starting finetunining on {train_dataset}...')
+        device = torch.device(f'cuda:{gpu}')
+        finetune_epochs = 20
+        lr = 1e-5
         weight_decay = 1e-4
         img_size = (224, 224)  # same as ImageNet
         batch_size = 224
@@ -284,10 +288,12 @@ class AdvPreTrain:
         model = MixBNModelBuilder(model_type=self.model_type, num_classes=self.pretrain_classes,
                                   pretrained=False, mix_bn=False).to(device)
         if self.pretrain_best_model.is_file():
-            cur_iter, best_val_acc1 = self.load_snapshot(model, None, None, self.pretrain_cur_model, device=device)
-            model.train()
+            cur_iter, best_val_acc1 = self.load_snapshot(model, None, None, self.pretrain_best_model, device=device)
             print(f'gpu:{gpu} loaded the best trained to iter:{cur_iter} with best_val:{best_val_acc1}')
-
+        # change the classifier layer of the model
+        model.model.classifier = torch.nn.Linear(1280, self.finetune_classes, device=device)
+        summary(model)
+        model.train()
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.999), weight_decay=weight_decay,
                                       amsgrad=False)
         optimizer.zero_grad()
@@ -299,7 +305,8 @@ class AdvPreTrain:
             for batch_idx, (data, labels, weights, multi_labels) in enumerate(train_dataloader):
                 if class_weights is None:
                     try:
-                        class_weights = torch.tensor([weights[labels == 0][0], weights[labels == 1][0]], device=device)
+                        class_weights = torch.tensor([weights[labels == 0][0], weights[labels == 1][0]],
+                                                     device=device, dtype=torch.float32)
                         criterion = torch.nn.CrossEntropyLoss(weight=class_weights).to(device)
                     except Exception as err:
                         print("batch has only one type of samples, moving to next...")
@@ -318,8 +325,8 @@ class AdvPreTrain:
                 loss.backward()
                 optimizer.step()
 
-                print(f"fine-tune epoch:{epoch}, idx:{batch_idx} loss:{loss.item()}")
-                wandb.log({f"fine-tune/{train_dataset}_loss": loss.item()})
+                print(f"fine-tune epoch:{epoch}, idx:{batch_idx}/{len(train_dataloader)} loss:{loss.item()}")
+                wandb.log({f"fine-tune/train_{train_dataset}_loss": loss.item()})
 
             # validation
             step_name = "validation"
@@ -335,29 +342,34 @@ class AdvPreTrain:
                     rgb_test_data = data.flip(dims=(1,))  # bgr to rgb
                     pred = model(rgb_test_data)
                     loss = criterion(pred, labels)
-                    wandb.log({f"{step_name}/{train_dataset}_loss": loss.item()})
+                    if step_name != "test":
+                        wandb.log({f"fine-tune/{step_name}_{train_dataset}_loss": loss.item()})
                     pred_probability = np.squeeze(torch.nn.functional.softmax(pred, dim=1).cpu().data.numpy()[:, 1])
                     preds.append(pred_probability)
-                    gt.append(labels.data.numpy())
+                    gt.append(labels.cpu().data.numpy())
                 gt = np.concatenate(gt, axis=0).flatten()
                 preds = np.concatenate(preds, axis=0).flatten()
                 f1 = f1_score(gt, preds > 0.5)
-                wandb.log({f"{step_name}/{train_dataset}_f1": f1})
+                if step_name != "test":
+                    wandb.log({f"fine-tune/{step_name}_{train_dataset}_f1": f1})
                 wandb.run.summary[f"{step_name}_{train_dataset}_f1"] = f1
                 model.train()
-                if best_val_f1 < f1:
+                if best_val_f1 is None or best_val_f1 < f1:
                     best_val_f1 = f1
-                    self.snapshot_gpu(model.module, optimizer, None, epoch, best_val_f1,
+                    self.snapshot_gpu(model, optimizer, None, epoch, best_val_f1,
                                       self.finetune_best_model[train_dataset])
             # snapshot the current model
-            self.snapshot_gpu(model.module, optimizer, None, epoch, f1, self.finetune_cur_model[train_dataset])
+            self.snapshot_gpu(model, optimizer, None, epoch, f1, self.finetune_cur_model[train_dataset])
 
     def __call__(self, gpu, ngpus):
-        wandb.init(project=self.project_name, dir=os.getenv('TMPDIR'), name=self.exp_name, id=self.exp_name,
+        dist.init_process_group(backend='nccl', rank=gpu, world_size=ngpus)
+        wandb_save_dir = pathlib.Path(os.getenv('TMPDIR')) / f'gpu{gpu}'
+        wandb_save_dir.mkdir(exist_ok=True, parents=True)
+        wandb.init(project=self.project_name, dir=str(wandb_save_dir), name=self.exp_name, id=self.exp_name,
                    reinit=True, resume=True)
         self.pretrain_imagenet(gpu, ngpus)
+        print(f"gpu:{gpu} done with ImageNet pretraining")
         if gpu == 0:
-            print('running fine-tuning on BATL gpu:{gpu}')
             self.finetune("BATL", gpu=gpu)
         if gpu == 1:
             print('running fine-tuning on HQ-WMCA gpu:{gpu}')
@@ -365,6 +377,11 @@ class AdvPreTrain:
         if gpu == 2:
             print('running fine-tuning on HQ-WMCA gpu:{gpu}')
             self.finetune("WMCA", gpu=gpu)
+        
+        dist.barrier(device_ids=[gpu]) # wait for all the process to finish
+        wandb.finish()
+        dist.destroy_process_group()
+        return 0
 
 
 if __name__ == "__main__":
@@ -383,4 +400,6 @@ if __name__ == "__main__":
 
     os.environ['MASTER_ADDR'] = '127.0.0.1'
     os.environ['MASTER_PORT'] = '8888'
-    mp.spawn(AdvPreTrain(args.config), nprocs=args.ngpus, args=(args.ngpus,))
+    mp.spawn(AdvPreTrain(args.config), nprocs=args.ngpus, args=(args.ngpus,), join=True)
+    print("done")
+
