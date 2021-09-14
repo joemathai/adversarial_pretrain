@@ -99,19 +99,18 @@ class MixBatchNorm2d(nn.Module):
 
 
 class MixBNModelBuilder(torch.nn.Module):
-    def __init__(self, model_type, num_classes=2, pretrained=True, mix_bn=False, mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)):
+    def __init__(self, model_type, num_classes=2, pretrained=True, mix_bn=False, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)):
         super().__init__()
         self.model = timm.create_model(model_type, pretrained=pretrained, num_classes=num_classes)
         if mix_bn:
             print("replacing the BatchNorm2d with MixBatchNorm2d")
             self.replace_bn_layers(self.model)
-        self.register_buffer('mean', torch.tensor(mean))
-        self.register_buffer('std', torch.tensor(std))
+        self.register_buffer('mean', torch.tensor(mean).view(-1, 1, 1))
+        self.register_buffer('std', torch.tensor(std).view(-1, 1, 1))
 
     def forward(self, imgs):
-        imgs = imgs.permute(0, 2, 3, 1)
-        imgs = (imgs - self.mean) / (self.std + 1e-8)
-        return self.model(imgs.permute(0, 3, 1, 2))
+        imgs.sub_(self.mean).div_(self.std)  # inplace
+        return self.model(imgs)
 
     @staticmethod
     def replace_bn_layers(model):
