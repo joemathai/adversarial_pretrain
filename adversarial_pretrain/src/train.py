@@ -200,7 +200,7 @@ class AdvPreTrain:
         train_dataloader_iterator = iter(train_dataloader)
         iterations_trained = 0
         for iter_idx in range(cur_iter, len(train_dataloader) * pretrain_epochs):
-
+            batch_load_time = time.time()
             iterations_trained += 1
             # for every epoch
             if (iter_idx + 1) % len(train_dataloader) == 0:
@@ -229,24 +229,27 @@ class AdvPreTrain:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0, norm_type=2.0)
             optimizer.step()
 
-            if gpu == 0:
+            if gpu == 0 and iter_idx % 10 == 0:
                 print(f"[pretrain] gpu: {gpu}/{ngpus} epoch: {(iter_idx + 1) // len(train_dataloader)},"
                       f" batch: {iter_idx % len(train_dataloader)}/{len(train_dataloader)},"
                       f" loss: {loss.item():.7f},"
-                      f" batch_time: {time.time() - start_batch}"
+                      f" batch_time: {time.time() - start_batch:.5f}, batch_load_time:{batch_load_time - start_batch:.5f}"
+                      f" model_time: {time.time() - batch_load_time:.5f}"
                       f" adv_success_rate: {adv_success_rate}, lr:{pretrain_lr}, wd:{pretrain_wd}")
                 wandb.log({'pretrain/train_ce_smooth_loss': loss.item(),
                            'pretrain/train_adv_success_rate': adv_success_rate})
 
             # periodically plot the accuracies on train batch
-            if gpu == 0 and (iter_idx + 1) % 200 == 0:
+            if gpu == 0 and (iter_idx + 1) % 500 == 0:
                 acc1, acc5 = self.accuracy(preds, labels, topk=(1, 5))
                 wandb.log({'pretrain/train_acc1': acc1.item(), 'pretrain/train_acc5': acc5.item(),
                            'pretrain/batch_time:': time.time() - start_batch,
                            'pretrain/epoch': (iter_idx + 1) // len(train_dataloader)}, commit=False)
+                # save cur state
+                self.snapshot_gpu(model, optimizer, scheduler, iter_idx + 1, acc1, self.pretrain_cur_model)
 
             # validate and checkpoint
-            if (iter_idx + 1) % len(train_dataloader) == 0:
+            if (iter_idx + 1) % (10 * len(train_dataloader)) == 0:
                 # if rank 0 then do validation
                 if gpu == 0:
                     print(f'[pretrain] gpu:{gpu} running validation')
@@ -278,9 +281,6 @@ class AdvPreTrain:
                             # note: saving the model without the DDP wrapper
                             self.snapshot_gpu(model.module, optimizer, scheduler, iter_idx + 1, best_val_acc1,
                                               self.pretrain_best_model)
-                    # save cur state
-                    self.snapshot_gpu(model, optimizer, scheduler, iter_idx + 1, np.mean(val_acc1s),
-                                      self.pretrain_cur_model)
 
                 print(f"[pretrain] gpu:{gpu} waiting on validation barrier")
                 dist.barrier(device_ids=[gpu])  # wait for all other ranks to get to this point
@@ -294,7 +294,7 @@ class AdvPreTrain:
         if self.large_gpu:
             finetune_epochs = 150
             lr = 2e-5
-            weight_decay = 1e-4
+            weight_decay = 1e-3
             img_size = (224, 224)
             batch_size = 248
         else:
@@ -312,7 +312,7 @@ class AdvPreTrain:
                                   pretrained=False, mix_bn=False).to(device)
         if self.pretrain_best_model.is_file():
             cur_iter, best_val_acc1 = self.load_snapshot(model, None, None, self.pretrain_best_model, device=device)
-            print(f'[finetune] gpu:{gpu} loaded the best trained to iter:{cur_iter} with best_val:{best_val_acc1}')
+            print(f'[finetune] {train_dataset} gpu:{gpu} loaded the best trained to iter:{cur_iter} with best_val:{best_val_acc1}')
         # change the classifier layer of the model
         model.model.classifier = torch.nn.Linear(1280, self.finetune_classes, device=device)
         summary(model)
@@ -348,7 +348,7 @@ class AdvPreTrain:
                 loss.backward()
                 optimizer.step()
 
-                print(f"[finetune] epoch:{epoch}, idx:{batch_idx}/{len(train_dataloader)} loss:{loss.item()}")
+                print(f"[finetune] {train_dataset} epoch:{epoch}, idx:{batch_idx}/{len(train_dataloader)} loss:{loss.item()}")
                 wandb.log({f"fine-tune/train_{train_dataset}_loss": loss.item()})
 
             # validation
@@ -374,8 +374,7 @@ class AdvPreTrain:
                     gt = np.concatenate(gt, axis=0).flatten()
                     preds = np.concatenate(preds, axis=0).flatten()
                     f1 = f1_score(gt, preds > 0.5)
-                    if step_name != "test":
-                        wandb.log({f"fine-tune/{step_name}_{train_dataset}_f1": f1})
+                    wandb.log({f"fine-tune/{step_name}_{train_dataset}_f1": f1})
                     wandb.run.summary[f"{step_name}_{train_dataset}_f1"] = f1
                     model.train()
                     if best_val_f1 is None or best_val_f1 < f1:
@@ -393,8 +392,8 @@ class AdvPreTrain:
             wandb.init(project=self.project_name, dir=str(wandb_save_dir), name=self.exp_name, id=self.exp_name,
                        reinit=True, resume=True)
 
-        for epochs, lr, wd in [(50, 5e-3, 1e-4), (100, 5e-3, 1e-4), (150, 1e-3, 1e-4), (200, 1e-3, 1e-4),
-                               (250, 5e-4, 1e-3), (300, 5e-4, 1e-3), (350, 3e-4, 2e-3), (400, 3e-4, 2e-3)]:
+        for epochs, lr, wd in [(50, 5e-3, 1e-4), (50, 5e-3, 1e-4), (50, 1e-3, 1e-4), (50, 1e-3, 1e-4),
+                               (50, 5e-4, 1e-3), (20, 5e-4, 1e-3), (20, 3e-4, 2e-3), (20, 3e-4, 2e-3)]:
             print(f"[__call__] gpu:{gpu} started ImageNet pretraining")
             iterations_trained = self.pretrain_imagenet(gpu, ngpus, epochs=epochs, lr=lr, wd=wd)
 
