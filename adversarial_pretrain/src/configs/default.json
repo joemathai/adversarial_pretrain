@@ -1,7 +1,7 @@
 {
-  "project_name": "ImageNet_pretrain_dist",
-  "exp_prefix": "ADAM",
-  "model_type": "tf_efficientnetv2_s_in21k",
+  "project_name": "ImageNet_prior_work",
+  "exp_prefix": "baseline",
+  "model_type": "wide_resnet50_2",
   "train_type": "clean",
   "pretrain_dataset_name": "ImageNet",
   "pretrain_dataset_root": "/nas/vista-ssd01/batl/public_datasets/ImageNet",

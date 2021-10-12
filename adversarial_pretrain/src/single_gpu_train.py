@@ -105,9 +105,10 @@ class AdvPreTrain:
         model.train()
         return adv_batch, success_rate
 
-    def pretrain_imagenet(self, gpu, ngpus, batch_size=224, epochs=100, lr=1e-3, wd=1e-4):
-        print(f'[pretrain] pretraining worker gpu/rank:{gpu} ngpus/world_size:{ngpus}')
-        device = torch.device(f"cuda:{gpu}")
+    def pretrain_imagenet(self, batch_size=224, epochs=100, lr=1e-3, wd=1e-4):
+        gpu = 0
+        ngpus = 1
+        device = torch.device(f"cuda")
         pretrain_epochs = epochs
         batch_size = batch_size
         pretrain_lr = lr
@@ -115,35 +116,30 @@ class AdvPreTrain:
 
         # copy imagenet data locally
         imagenet_root = pathlib.Path(f"{os.getenv('TMPDIR')}/imagenet_data")
-        if gpu == 0:
-            imagenet_root.mkdir(exist_ok=True, parents=True)
-            if not (imagenet_root / "ILSVRC2012_img_train.tar").is_file():
-                print('[pretrain] copying ImageNet train.tar to LFS')
-                shutil.copy(f"{self.config['pretrain_dataset_root']}/ILSVRC2012_img_train.tar", str(imagenet_root))
-            if not (imagenet_root / "ILSVRC2012_img_val.tar").is_file():
-                print('[pretrain] copying ImageNet val.tar to LFS')
-                shutil.copy(f"{self.config['pretrain_dataset_root']}/ILSVRC2012_img_val.tar", str(imagenet_root))
-            if not (imagenet_root / "ILSVRC2012_devkit_t12.tar.gz").is_file():
-                print('[pretrain] copying ImageNet devkit.tar to LFS')
-                shutil.copy(f"{self.config['pretrain_dataset_root']}/ILSVRC2012_devkit_t12.tar.gz",
-                            str(imagenet_root))
-            if not (imagenet_root / "meta.bin").is_file():
-                shutil.copy(f"{self.config['pretrain_dataset_root']}/meta.bin",
-                            str(imagenet_root))
-            # unpack the data using torchvision dataset utils
-            torchvision.datasets.ImageNet(root=str(imagenet_root), split="train")
-            torchvision.datasets.ImageNet(root=str(imagenet_root), split="val")
+        imagenet_root.mkdir(exist_ok=True, parents=True)
+        if not (imagenet_root / "ILSVRC2012_img_train.tar").is_file():
+            print('[pretrain] copying ImageNet train.tar to LFS')
+            shutil.copy(f"{self.config['pretrain_dataset_root']}/ILSVRC2012_img_train.tar", str(imagenet_root))
+        if not (imagenet_root / "ILSVRC2012_img_val.tar").is_file():
+            print('[pretrain] copying ImageNet val.tar to LFS')
+            shutil.copy(f"{self.config['pretrain_dataset_root']}/ILSVRC2012_img_val.tar", str(imagenet_root))
+        if not (imagenet_root / "ILSVRC2012_devkit_t12.tar.gz").is_file():
+            print('[pretrain] copying ImageNet devkit.tar to LFS')
+            shutil.copy(f"{self.config['pretrain_dataset_root']}/ILSVRC2012_devkit_t12.tar.gz", str(imagenet_root))
+        if not (imagenet_root / "meta.bin").is_file():
+            shutil.copy(f"{self.config['pretrain_dataset_root']}/meta.bin", str(imagenet_root))
+            
+        # unpack the data using torchvision dataset utils
+        torchvision.datasets.ImageNet(root=str(imagenet_root), split="train")
+        torchvision.datasets.ImageNet(root=str(imagenet_root), split="val")
 
-        print(f"[pretrain] gpu:{gpu} waiting for ImageNet dataset to be unzipped")
-        dist.barrier(device_ids=[gpu])  # wait for gpu:0 to copy the files to unpack them
-        print(f"[pretrain] gpu:{gpu} done with ImageNet dataset processing")
         pretrain_train_dataset = torchvision.datasets.ImageFolder(str(imagenet_root / 'train'),
                                                                   transform=torchvision.transforms.Compose([
                                                                       torchvision.transforms.RandomResizedCrop(224),
                                                                       torchvision.transforms.RandomHorizontalFlip(),
-                                                                      torchvision.transforms.ColorJitter(brightness=0.4,
-                                                                                                         contrast=0.4,
-                                                                                                         saturation=0.4),
+                                                                      torchvision.transforms.ColorJitter(brightness=0.3,
+                                                                                                         contrast=0.3,
+                                                                                                         saturation=0.3),
                                                                       torchvision.transforms.ToTensor()
                                                                   ]))
         pretrain_valid_dataset = torchvision.datasets.ImageFolder(str(imagenet_root / 'val'),
@@ -153,24 +149,17 @@ class AdvPreTrain:
                                                                       torchvision.transforms.ToTensor()
                                                                   ]))
         # setup the model
-        # model = MixBNModelBuilder(model_type=self.model_type, num_classes=self.pretrain_classes,
-        #                           pretrained=False, mix_bn=False).to(device)
-        model = torchvision.models.wide_resnet50_2(pretrained=False, num_classes=self.pretrain_classes).to(device)
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
-
-        # print model architecture
-        if gpu == 0:
-            summary(model)
+        model = MixBNModelBuilder(model_type=self.model_type, num_classes=self.pretrain_classes,
+                                  pretrained=True, mix_bn=False).to(device)
+        summary(model)
 
         # setup the dataloader
-        train_sampler = torch.utils.data.distributed.DistributedSampler(pretrain_train_dataset, rank=gpu, shuffle=True,
-                                                                        drop_last=True)
         train_dataloader = torch.utils.data.DataLoader(pretrain_train_dataset, batch_size=batch_size,
                                                        num_workers=4, pin_memory=True,
                                                        worker_init_fn=self.worker_init,
                                                        prefetch_factor=batch_size // 8,
                                                        persistent_workers=True,
-                                                       sampler=train_sampler
+                                                       shuffle=True
                                                        )
         valid_dataloader = torch.utils.data.DataLoader(pretrain_valid_dataset, batch_size=batch_size,
                                                        shuffle=False, num_workers=4, pin_memory=False, drop_last=False)
@@ -178,7 +167,8 @@ class AdvPreTrain:
         cur_iter = 0
         best_val_acc1 = -np.inf
         criterion = LabelSmoothingCrossEntropy(smoothing=0.1)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=pretrain_lr, weight_decay=pretrain_wd)
+        # optimizer = torch.optim.AdamW(model.parameters(), lr=pretrain_lr, weight_decay=pretrain_wd)
+        optimizer = torch.optim.SGD(model.parameters(), lr=pretrain_lr, weight_decay=pretrain_wd, momentum=0.9)
         scheduler = None
 
         if self.pretrain_cur_model.is_file():
@@ -197,9 +187,6 @@ class AdvPreTrain:
         for iter_idx in range(cur_iter, len(train_dataloader) * pretrain_epochs):
             batch_load_time = time.time()
             iterations_trained += 1
-            # for every epoch
-            if (iter_idx + 1) % len(train_dataloader) == 0:
-                train_sampler.set_epoch(iter_idx // len(train_dataloader))
 
             try:
                 data, labels = next(train_dataloader_iterator)
@@ -280,9 +267,6 @@ class AdvPreTrain:
                             self.snapshot_gpu(model.module, optimizer, scheduler, iter_idx + 1, best_val_acc1,
                                               self.pretrain_best_model.parent / "pretrain_acc1_{:.2f}.pth")
 
-                print(f"[pretrain] gpu:{gpu} waiting on validation barrier")
-                dist.barrier(device_ids=[gpu])  # wait for all other ranks to get to this point
-                print(f"[pretrain] gpu:{gpu} done with validation barrier")
             start_batch = time.time()
         return iterations_trained
 
@@ -299,9 +283,8 @@ class AdvPreTrain:
             patch_dataset, train_partition, valid_partition, test_partition) = get_dataloader(train_dataset,
                                                                                               batch_size=batch_size,
                                                                                               img_size=img_size)
-        # model = MixBNModelBuilder(model_type=self.model_type, num_classes=self.pretrain_classes,
-        #                           pretrained=False, mix_bn=False).to(device)
-        model = torchvision.models.wide_resnet50_2(pretrained=False, num_classes=self.pretrain_classes).to(device)
+        model = MixBNModelBuilder(model_type=self.model_type, num_classes=self.pretrain_classes,
+                                  pretrained=False, mix_bn=False).to(device)
         if self.pretrain_best_model.is_file():
             cur_iter, best_val_acc1 = self.load_snapshot(model, None, None, self.pretrain_best_model, device=device)
             print(f'[finetune] {train_dataset} gpu:{gpu} loaded the best trained to iter:{cur_iter} with best_val:{best_val_acc1}')
@@ -391,45 +374,26 @@ class AdvPreTrain:
                 print(f"[finetune] {train_dataset} epoch:{epoch}, idx:{batch_idx}/{len(train_dataloader)} loss:{loss.item()}")
                 wandb.log({f"fine-tune/train_{train_dataset}_loss": loss.item()})
 
-    def __call__(self, gpu, ngpus):
-        dist.init_process_group(backend='nccl', rank=gpu, world_size=ngpus)
-        wandb_save_dir = pathlib.Path(os.getenv('TMPDIR')) / f'gpu{gpu}'
+    def __call__(self):
+        wandb_save_dir = pathlib.Path(os.getenv('TMPDIR')) / 'wandb'
         wandb_save_dir.mkdir(exist_ok=True, parents=True)
-        if gpu == 0:
-            wandb.init(project=self.project_name, dir=str(wandb_save_dir), group=self.exp_name, job_type=f'pretrain-{gpu}',
-                       id=self.exp_name + f'_pretrain_{gpu}', reinit=True, resume=True)
-        else:
-            time.sleep(3)
-            wandb.init(project=self.project_name, dir=str(wandb_save_dir), group=self.exp_name, job_type=f'pretrain-{gpu}',
-                       id=self.exp_name + f'_pretrain_{gpu}', reinit=True, resume=True)
-
-        for batch_size, epochs, lr, wd in [(256, 250, 1e-1, 1e-4), (128, 150, 1e-2, 1e-4), (224, 250, 1e-3, 1e-4),
-                                           (400, 600, 1e-1, 2e-3)]:
-            iterations_trained = self.pretrain_imagenet(gpu, ngpus, batch_size=batch_size, epochs=epochs, lr=lr, wd=wd)
-            dist.barrier(device_ids=[gpu])  # wait for all the process to finish
-
-        # to-do for each of the best model checkpoint from the pretrain stage train a model on the Face PAD dataset
-
+        wandb.init(project=self.project_name, dir=str(wandb_save_dir), name=self.exp_name,
+                   id=self.exp_name, reinit=True, resume=True)
+        
+        for batch_size, epochs, lr, wd in [(256, 250, 1e-1, 1e-4)]:
+            iterations_trained = self.pretrain_imagenet(batch_size=batch_size, epochs=epochs, lr=lr, wd=wd)
         wandb.finish()
-        dist.destroy_process_group()
         return 0
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Parser for BATL adv. training')
     parser.add_argument('--config', type=str, required=True)
-    parser.add_argument('--ngpus', type=int, default=1)
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
         print('cuda is not available exiting....')
         exit(1)
 
-    if torch.cuda.device_count() != args.ngpus:
-        print("cuda device count and input gpu count mismatch")
-        exit(1)
-
-    os.environ['MASTER_ADDR'] = '127.0.0.1'
-    os.environ['MASTER_PORT'] = '8888'
-    mp.spawn(AdvPreTrain(args.config), nprocs=args.ngpus, args=(args.ngpus,), join=True)
+    AdvPreTrain(args.config)()
     print("done")

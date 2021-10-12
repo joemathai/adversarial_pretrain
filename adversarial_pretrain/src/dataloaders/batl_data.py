@@ -18,7 +18,7 @@ def save_mem_collate_fc(batch):
 
 
 def worker_init(wid):
-    return np.random.seed(np.random.get_state()[1][0] + wid)
+    return np.random.seed(np.random.randint(1, 1000) + wid)
 
 
 def square_face_detector(device: (None, str) = None, flexible: bool = True):
@@ -94,14 +94,14 @@ def _get_data(db_directories, gt_files, db_partitions, data_type="COLOR", batch_
                                        patch_generator=patch_generator,
                                        make_transform=None,
                                        vista_subpath='BATL_FACE',
+                                       vista_output_dir="/nas/vista-hdd01/batl/batl_isi_pad_datasets",
                                        copy_data_locally=copy_data_locally,
                                        load_data_in_memory=load_data_in_memory,
                                        dataset_storage_name="WMCA_RGB_Preprocessed" if 'WMCA' in db_directories[
                                            0] else None,
                                        num_classes=multi_label_data.get_num_classes(),
                                        getitem_vars=('data', 'labels_binary', 'weights_binary', 'labels_multi'),
-                                       verbose=False,
-                                       output_dir="/nas/vista-ssd01/batl/batl_isi_pad_datasets/BATL_FACE")
+                                       verbose=True)
 
     data_loaders = list()
     transform = None
@@ -152,10 +152,10 @@ def _get_data(db_directories, gt_files, db_partitions, data_type="COLOR", batch_
     return data_loaders, None, None, (patch_dataset, train_partition, valid_partition, test_partition)
 
 
-def get_dataloader(dataset_name, batch_size, img_size=(224, 224)):
+def get_dataloader(dataset_name, batch_size, img_size=(224, 224), num_frames=5, data_type='COLOR'):
     db_directories = {
         "BATL": [
-            "/nas/vista-hdd01/batl/odin-phase-2-self-test-3/FACE",
+            # "/nas/vista-hdd01/batl/odin-phase-2-self-test-3/FACE",
             "/nas/vista-hdd01/batl/GCT-2/FACE",
             "/nas/vista-hdd01/batl/odin-phase-2-self-test-4/FACE",
             "/nas/vista-hdd01/batl/GCT-3/FACE",
@@ -166,7 +166,7 @@ def get_dataloader(dataset_name, batch_size, img_size=(224, 224)):
     }
     gt_files = {
         "BATL": [
-            "/nas/vista-ssd01/batl/odin-phase-2-self-test-3/batl_st3_partitions/st3_0225_0308_FACE_ground_truth.csv",
+            # "/nas/vista-ssd01/batl/odin-phase-2-self-test-3/batl_st3_partitions/st3_0225_0308_FACE_ground_truth.csv",
             "/nas/vista-ssd01/batl/GCT-2/batl_gct2_partitions/gct2_0508_0523_FACE_ground_truth.csv",
             "/nas/vista-ssd01/batl/odin-phase-2-self-test-4/batl_st4_partitions/st4_0903_0910_FACE_ground_truth.csv",
             "/nas/vista-ssd01/batl/GCT-3/batl_gct3_partitions/gct3_1025_1115_FACE_ground_truth.csv",
@@ -178,7 +178,7 @@ def get_dataloader(dataset_name, batch_size, img_size=(224, 224)):
     # no consolidated partitions for gct4 and idiap
     db_partitions = {
         "BATL": [
-            "/nas/vista-ssd01/batl/odin-phase-2-self-test-3/batl_st3_partitions/consolidated_partitions/st3_dataset_partition_FACE_3folds_part0.csv",
+            # "/nas/vista-ssd01/batl/odin-phase-2-self-test-3/batl_st3_partitions/consolidated_partitions/st3_dataset_partition_FACE_3folds_part0.csv",
             "/nas/vista-ssd01/batl/GCT-2/batl_gct2_partitions/consolidated_partitions/gct2_dataset_partition_FACE_3folds_part0.csv",
             "/nas/vista-ssd01/batl/odin-phase-2-self-test-4/batl_st4_partitions/consolidated_partitions/st4_dataset_partition_FACE_3folds_part0.csv",
             "/nas/vista-ssd01/batl/GCT-3/batl_gct3_partitions/consolidated_partitions/gct3_dataset_partition_FACE_3folds_part0.csv",
@@ -191,6 +191,6 @@ def get_dataloader(dataset_name, batch_size, img_size=(224, 224)):
     }
 
     return _get_data(db_directories[dataset_name], gt_files[dataset_name], db_partitions[dataset_name],
-                     data_type='COLOR', batch_size=batch_size, num_frames=10, frames_spacing='equally_spaced',
+                     data_type=data_type, batch_size=batch_size, num_frames=num_frames, frames_spacing='equally_spaced',
                      img_size=img_size, copy_data_locally=True, load_data_in_memory=False)
 
